@@ -24,11 +24,6 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
-      - name: Rename binary to release asset name
-        shell: pwsh
-        run: |
-          Copy-Item target/release/claude-codex-usage-monitor.exe "target/release/${{ env.RELEASE_ASSET_NAME }}" -Force
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
