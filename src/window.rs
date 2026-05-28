@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -122,6 +122,11 @@ const IDM_LANG_TRADITIONAL_CHINESE: u16 = 48;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
 
+const IDM_BAR_THEME_SEGMENTED: u16 = 70;
+const IDM_BAR_THEME_FLAT: u16 = 71;
+const IDM_BAR_THEME_GRADIENT: u16 = 72;
+const IDM_BAR_THEME_PIXEL: u16 = 73;
+
 const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
@@ -132,6 +137,84 @@ static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None)
 
 /// Current system DPI (96 = 100% scaling, 144 = 150%, 192 = 200%, etc.)
 static CURRENT_DPI: AtomicU32 = AtomicU32::new(96);
+
+/// Selected usage-bar visual theme, stored lock-free so the paint path can read
+/// it without taking the state lock. Kept in sync with the persisted setting.
+static CURRENT_BAR_THEME: AtomicU8 = AtomicU8::new(0);
+
+/// Visual style of the usage bar. `Segmented` is the original default and keeps
+/// the brand accent colors; the other themes color-code by usage threshold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BarTheme {
+    Segmented,
+    Flat,
+    Gradient,
+    Pixel,
+}
+
+impl BarTheme {
+    const ALL: [BarTheme; 4] = [
+        BarTheme::Segmented,
+        BarTheme::Flat,
+        BarTheme::Gradient,
+        BarTheme::Pixel,
+    ];
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => BarTheme::Flat,
+            2 => BarTheme::Gradient,
+            3 => BarTheme::Pixel,
+            _ => BarTheme::Segmented,
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            BarTheme::Segmented => 0,
+            BarTheme::Flat => 1,
+            BarTheme::Gradient => 2,
+            BarTheme::Pixel => 3,
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            BarTheme::Segmented => "segmented",
+            BarTheme::Flat => "flat",
+            BarTheme::Gradient => "gradient",
+            BarTheme::Pixel => "pixel",
+        }
+    }
+
+    fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "segmented" => Some(BarTheme::Segmented),
+            "flat" => Some(BarTheme::Flat),
+            "gradient" => Some(BarTheme::Gradient),
+            "pixel" => Some(BarTheme::Pixel),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            BarTheme::Segmented => "Segmented blocks",
+            BarTheme::Flat => "Minimal flat",
+            BarTheme::Gradient => "Gradient glow",
+            BarTheme::Pixel => "Retro pixel",
+        }
+    }
+
+    /// Themes other than the default color-code the fill by usage threshold.
+    fn uses_threshold_color(self) -> bool {
+        !matches!(self, BarTheme::Segmented)
+    }
+}
+
+fn current_bar_theme() -> BarTheme {
+    BarTheme::from_u8(CURRENT_BAR_THEME.load(Ordering::Relaxed))
+}
 
 /// Scale a base pixel value (designed at 96 DPI) to the current DPI.
 fn sc(px: i32) -> i32 {
@@ -213,6 +296,8 @@ struct SettingsFile {
     show_claude_code: bool,
     #[serde(default = "default_show_codex")]
     show_codex: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bar_theme: Option<String>,
 }
 
 impl Default for SettingsFile {
@@ -225,6 +310,7 @@ impl Default for SettingsFile {
             widget_visible: true,
             show_claude_code: true,
             show_codex: false,
+            bar_theme: None,
         }
     }
 }
@@ -280,6 +366,7 @@ fn save_state_settings() {
             widget_visible: s.widget_visible,
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
+            bar_theme: Some(current_bar_theme().code().to_string()),
         });
     }
 }
@@ -866,6 +953,31 @@ fn claude_accent_color() -> Color {
     Color::from_hex("#D97757")
 }
 
+/// Color-code a usage percentage as green -> yellow -> orange -> red. Used by
+/// the non-default bar themes. Slightly brighter tones in dark mode.
+fn usage_threshold_color(percent: f64, is_dark: bool) -> Color {
+    let p = percent.clamp(0.0, 100.0);
+    if is_dark {
+        if p >= 95.0 {
+            Color::from_hex("#FF5C5C")
+        } else if p >= 90.0 {
+            Color::from_hex("#FF8A4C")
+        } else if p >= 80.0 {
+            Color::from_hex("#F2C14E")
+        } else {
+            Color::from_hex("#4CC76B")
+        }
+    } else if p >= 95.0 {
+        Color::from_hex("#D32F2F")
+    } else if p >= 90.0 {
+        Color::from_hex("#E8731C")
+    } else if p >= 80.0 {
+        Color::from_hex("#C9A21E")
+    } else {
+        Color::from_hex("#2E9E4F")
+    }
+}
+
 fn codex_accent_color(is_dark: bool) -> Color {
     if is_dark {
         Color::from_hex("#F5F5F5")
@@ -945,6 +1057,12 @@ pub fn run() {
         }
 
         let settings = load_settings();
+        let initial_bar_theme = settings
+            .bar_theme
+            .as_deref()
+            .and_then(BarTheme::from_code)
+            .unwrap_or(BarTheme::Segmented);
+        CURRENT_BAR_THEME.store(initial_bar_theme.to_u8(), Ordering::Relaxed);
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
@@ -2280,6 +2398,20 @@ unsafe extern "system" fn wnd_proc(
                     save_state_settings();
                     render_layered();
                 }
+                IDM_BAR_THEME_SEGMENTED
+                | IDM_BAR_THEME_FLAT
+                | IDM_BAR_THEME_GRADIENT
+                | IDM_BAR_THEME_PIXEL => {
+                    let theme = match id {
+                        IDM_BAR_THEME_FLAT => BarTheme::Flat,
+                        IDM_BAR_THEME_GRADIENT => BarTheme::Gradient,
+                        IDM_BAR_THEME_PIXEL => BarTheme::Pixel,
+                        _ => BarTheme::Segmented,
+                    };
+                    CURRENT_BAR_THEME.store(theme.to_u8(), Ordering::Relaxed);
+                    save_state_settings();
+                    render_layered();
+                }
                 id if id == tray_icon::IDM_TOGGLE_WIDGET => {
                     toggle_widget_visibility(hwnd);
                 }
@@ -2503,6 +2635,37 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(language_label.as_ptr()),
         );
 
+        // Bar Style submenu
+        let bar_style_menu = CreatePopupMenu().unwrap();
+        let current_theme = current_bar_theme();
+        for theme in BarTheme::ALL {
+            let id = match theme {
+                BarTheme::Segmented => IDM_BAR_THEME_SEGMENTED,
+                BarTheme::Flat => IDM_BAR_THEME_FLAT,
+                BarTheme::Gradient => IDM_BAR_THEME_GRADIENT,
+                BarTheme::Pixel => IDM_BAR_THEME_PIXEL,
+            };
+            let label_str = native_interop::wide_str(theme.label());
+            let flags = if theme == current_theme {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                bar_style_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label_str.as_ptr()),
+            );
+        }
+        let bar_style_label = native_interop::wide_str("Bar Style");
+        let _ = AppendMenuW(
+            settings_menu,
+            MF_POPUP,
+            bar_style_menu.0 as usize,
+            PCWSTR::from_raw(bar_style_label.as_ptr()),
+        );
+
         let _ = AppendMenuW(settings_menu, MF_SEPARATOR, 0, PCWSTR::null());
 
         let version_label =
@@ -2721,6 +2884,7 @@ fn draw_row(
                 claude_accent,
                 track,
                 &claude_value_color,
+                is_dark,
             );
             model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
         }
@@ -2735,6 +2899,7 @@ fn draw_row(
                 codex_accent,
                 track,
                 &codex_value_color,
+                is_dark,
             );
         }
     }
@@ -2746,6 +2911,7 @@ fn model_usage_width(segment_count: i32) -> i32 {
         + sc(TEXT_WIDTH)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_usage_bar(
     hdc: HDC,
     bar_x: i32,
@@ -2756,12 +2922,79 @@ fn draw_usage_bar(
     accent: &Color,
     track: &Color,
     text_color: &Color,
+    is_dark: bool,
 ) {
     let seg_w = sc(SEGMENT_W);
     let seg_h = sc(SEGMENT_H);
     let seg_gap = sc(SEGMENT_GAP);
     let corner_r = sc(CORNER_RADIUS);
+    let bar_w = segment_count * (seg_w + seg_gap) - seg_gap;
 
+    let theme = current_bar_theme();
+    // Non-default themes color-code the fill by usage threshold; the default
+    // keeps the brand accent color so existing behavior is unchanged.
+    let fill = if theme.uses_threshold_color() {
+        usage_threshold_color(percent, is_dark)
+    } else {
+        *accent
+    };
+
+    match theme {
+        BarTheme::Segmented => draw_bar_segmented(
+            hdc,
+            bar_x,
+            y,
+            segment_count,
+            percent,
+            accent,
+            track,
+            seg_w,
+            seg_h,
+            seg_gap,
+            corner_r,
+        ),
+        BarTheme::Flat => {
+            draw_bar_flat(hdc, bar_x, y, bar_w, seg_h, percent, &fill, track, corner_r)
+        }
+        BarTheme::Gradient => {
+            draw_bar_gradient(hdc, bar_x, y, bar_w, seg_h, percent, &fill, track, corner_r)
+        }
+        BarTheme::Pixel => draw_bar_pixel(hdc, bar_x, y, bar_w, seg_h, percent, &fill, track),
+    }
+
+    unsafe {
+        let text_x = bar_x + bar_w + sc(BAR_RIGHT_MARGIN);
+        let mut text_wide: Vec<u16> = text.encode_utf16().collect();
+        let mut text_rect = RECT {
+            left: text_x,
+            top: y,
+            right: text_x + sc(TEXT_WIDTH),
+            bottom: y + seg_h,
+        };
+        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+        let _ = DrawTextW(
+            hdc,
+            &mut text_wide,
+            &mut text_rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_bar_segmented(
+    hdc: HDC,
+    bar_x: i32,
+    y: i32,
+    segment_count: i32,
+    percent: f64,
+    accent: &Color,
+    track: &Color,
+    seg_w: i32,
+    seg_h: i32,
+    seg_gap: i32,
+    corner_r: i32,
+) {
     unsafe {
         let percent_clamped = percent.clamp(0.0, 100.0);
         let segment_percent = 100.0 / segment_count as f64;
@@ -2810,23 +3043,175 @@ fn draw_usage_bar(
                 }
             }
         }
-
-        let text_x = bar_x + segment_count * (seg_w + seg_gap) - seg_gap + sc(BAR_RIGHT_MARGIN);
-        let mut text_wide: Vec<u16> = text.encode_utf16().collect();
-        let mut text_rect = RECT {
-            left: text_x,
-            top: y,
-            right: text_x + sc(TEXT_WIDTH),
-            bottom: y + seg_h,
-        };
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-        let _ = DrawTextW(
-            hdc,
-            &mut text_wide,
-            &mut text_rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-        );
     }
+}
+
+/// Minimal flat: one continuous rounded track with a proportional rounded fill.
+#[allow(clippy::too_many_arguments)]
+fn draw_bar_flat(
+    hdc: HDC,
+    bar_x: i32,
+    y: i32,
+    bar_w: i32,
+    bar_h: i32,
+    percent: f64,
+    fill: &Color,
+    track: &Color,
+    corner_r: i32,
+) {
+    unsafe {
+        let track_rect = RECT {
+            left: bar_x,
+            top: y,
+            right: bar_x + bar_w,
+            bottom: y + bar_h,
+        };
+        draw_rounded_rect(hdc, &track_rect, track, corner_r);
+
+        let pct = percent.clamp(0.0, 100.0);
+        let fill_w = (bar_w as f64 * pct / 100.0).round() as i32;
+        if fill_w > 0 {
+            let rgn = CreateRoundRectRgn(
+                track_rect.left,
+                track_rect.top,
+                track_rect.right + 1,
+                track_rect.bottom + 1,
+                corner_r * 2,
+                corner_r * 2,
+            );
+            let _ = SelectClipRgn(hdc, rgn);
+            let fill_rect = RECT {
+                left: bar_x,
+                top: y,
+                right: bar_x + fill_w,
+                bottom: y + bar_h,
+            };
+            let brush = CreateSolidBrush(COLORREF(fill.to_colorref()));
+            FillRect(hdc, &fill_rect, brush);
+            let _ = DeleteObject(brush);
+            let _ = SelectClipRgn(hdc, HRGN::default());
+            let _ = DeleteObject(rgn);
+        }
+    }
+}
+
+/// Gradient glow: rounded track with the fill drawn as a horizontal gradient
+/// from a lighter tint of the threshold color to the full color.
+#[allow(clippy::too_many_arguments)]
+fn draw_bar_gradient(
+    hdc: HDC,
+    bar_x: i32,
+    y: i32,
+    bar_w: i32,
+    bar_h: i32,
+    percent: f64,
+    fill: &Color,
+    track: &Color,
+    corner_r: i32,
+) {
+    unsafe {
+        let track_rect = RECT {
+            left: bar_x,
+            top: y,
+            right: bar_x + bar_w,
+            bottom: y + bar_h,
+        };
+        draw_rounded_rect(hdc, &track_rect, track, corner_r);
+
+        let pct = percent.clamp(0.0, 100.0);
+        let fill_w = (bar_w as f64 * pct / 100.0).round() as i32;
+        if fill_w > 0 {
+            let rgn = CreateRoundRectRgn(
+                track_rect.left,
+                track_rect.top,
+                track_rect.right + 1,
+                track_rect.bottom + 1,
+                corner_r * 2,
+                corner_r * 2,
+            );
+            let _ = SelectClipRgn(hdc, rgn);
+            let start = lighten_color(fill, 0.5);
+            let denom = fill_w.max(1) as f64;
+            for col in 0..fill_w {
+                let t = col as f64 / denom;
+                let c = lerp_color(&start, fill, t);
+                let col_rect = RECT {
+                    left: bar_x + col,
+                    top: y,
+                    right: bar_x + col + 1,
+                    bottom: y + bar_h,
+                };
+                let brush = CreateSolidBrush(COLORREF(c.to_colorref()));
+                FillRect(hdc, &col_rect, brush);
+                let _ = DeleteObject(brush);
+            }
+            let _ = SelectClipRgn(hdc, HRGN::default());
+            let _ = DeleteObject(rgn);
+        }
+    }
+}
+
+/// Retro pixel: a grid of small sharp-cornered squares; columns light up to the
+/// usage percentage, the rest stay dim.
+fn draw_bar_pixel(
+    hdc: HDC,
+    bar_x: i32,
+    y: i32,
+    bar_w: i32,
+    bar_h: i32,
+    percent: f64,
+    fill: &Color,
+    track: &Color,
+) {
+    unsafe {
+        let px = sc(3).max(2);
+        let gap = sc(1).max(1);
+        let step = px + gap;
+        let cols = ((bar_w + gap) / step).max(1);
+        let rows = ((bar_h + gap) / step).max(1);
+        let used_h = rows * step - gap;
+        let top0 = y + (bar_h - used_h).max(0) / 2;
+
+        let pct = percent.clamp(0.0, 100.0);
+        let filled_cols = (cols as f64 * pct / 100.0).round() as i32;
+
+        let fill_brush = CreateSolidBrush(COLORREF(fill.to_colorref()));
+        let track_brush = CreateSolidBrush(COLORREF(track.to_colorref()));
+        for cx in 0..cols {
+            let on = cx < filled_cols;
+            for ry in 0..rows {
+                let left = bar_x + cx * step;
+                let top = top0 + ry * step;
+                let cell = RECT {
+                    left,
+                    top,
+                    right: left + px,
+                    bottom: top + px,
+                };
+                FillRect(hdc, &cell, if on { fill_brush } else { track_brush });
+            }
+        }
+        let _ = DeleteObject(fill_brush);
+        let _ = DeleteObject(track_brush);
+    }
+}
+
+fn lighten_color(c: &Color, t: f64) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    Color::new(
+        (c.r as f64 + (255.0 - c.r as f64) * t).round() as u8,
+        (c.g as f64 + (255.0 - c.g as f64) * t).round() as u8,
+        (c.b as f64 + (255.0 - c.b as f64) * t).round() as u8,
+    )
+}
+
+fn lerp_color(a: &Color, b: &Color, t: f64) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    Color::new(
+        (a.r as f64 + (b.r as f64 - a.r as f64) * t).round() as u8,
+        (a.g as f64 + (b.g as f64 - a.g as f64) * t).round() as u8,
+        (a.b as f64 + (b.b as f64 - a.b as f64) * t).round() as u8,
+    )
 }
 
 fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
