@@ -16,9 +16,11 @@ It sits in your taskbar and shows how much of your Claude and Codex usage window
 - Optional Codex usage bars alongside Claude
 - A live countdown until each limit resets
 - A small native widget that lives directly in the Windows taskbar
+- **Switchable bar styles**: Segmented blocks, Minimal flat, Gradient glow, Retro pixel
+- **Pixel companion characters** (cat and/or dog) that roam above the widget and react to your usage
 - System tray icon badges showing your enabled model usage percentage
 - Left-click the tray icon to toggle the taskbar widget on or off
-- Right-click options for refresh, displayed models, update frequency, language, startup, and updates
+- Right-click options for displayed models, bar style, characters, refresh, update frequency, language, startup, and updates
 
 ## Who This Is For
 
@@ -38,20 +40,25 @@ If you use Claude Code through WSL, that is supported too. The monitor can read 
 
 ## Install
 
-Download the latest `claude-codex-usage-monitor.exe` from the [Releases](https://github.com/Ch1nzo/claude-codex-usage-monitor/releases) page and run it directly.
+Download the latest installer (`claude-codex-usage-monitor-setup.exe`) from the [Releases](https://github.com/Ch1nzo/claude-codex-usage-monitor/releases) page and run it.
+
+The installer is **per-user and needs no administrator rights**. It:
+
+- Installs to `%LOCALAPPDATA%\Programs\ClaudeCodexUsageMonitor`
+- Adds a **Start Menu** shortcut
+- Registers the app in **Settings → Apps → Installed apps** so it can be uninstalled the normal way
+- Offers a **"Launch"** checkbox when setup finishes
+
+To uninstall, use **Settings → Apps → Installed apps → Claude & Codex Usage Monitor → Uninstall** (or run the bundled `uninstall.exe`).
 
 ## Use
 
-Run the executable:
+Launch **Claude & Codex Usage Monitor** from the Start Menu (or tick "Launch" at the end of setup).
 
-```powershell
-claude-codex-usage-monitor
-```
-
-Once running, it will appear in your taskbar and as one or more tray icons in the notification area.
+Once running, it appears in your taskbar and as one or more tray icons in the notification area.
 
 - Drag the left divider to move the taskbar widget
-- Right-click the taskbar widget or tray icon for refresh, displayed models, update frequency, Start with Windows, reset position, language, updates, and exit
+- Right-click the taskbar widget or tray icon for displayed models, bar style, characters, refresh, update frequency, Start with Windows, reset position, language, updates, and exit
 - Left-click the tray icon to toggle the taskbar widget on or off
 - Enable `Start with Windows` from the right-click menu if you want it to launch automatically when you sign in
 
@@ -63,6 +70,26 @@ Use the right-click **Models** menu to choose what the widget displays:
 - **Codex** can be enabled alongside Claude Code or shown by itself
 
 When both models are shown, each model has its own usage bar and matching usage text color.
+
+### Bar Style
+
+Use the right-click **Bar Style** menu to switch how the usage bar is drawn:
+
+- **Segmented blocks** — the default, with the model's brand accent color
+- **Minimal flat** — a single continuous bar
+- **Gradient glow** — a glowing gradient fill
+- **Retro pixel** — a chunky pixel-block meter
+
+The non-default styles color-code the fill by usage threshold (green → yellow → orange → red). Your choice is saved and applied instantly.
+
+### Characters
+
+Use the right-click **Characters** menu to show a small pixel companion that roams just above the widget:
+
+- Toggle the characters on or off
+- Choose **Cat**, **Dog**, or **Both**
+
+The characters idle, walk, and blink, and react to your usage: they show an encouraging note when you have room, a soft warning past 80%, an urgent warning past 90%, and a "nice work" message when usage resets. **Hover** over a character for a reaction after a moment, or **click** it for a quick response — the cat is aloof, the dog is eager. Messages are available in Japanese and English (other languages fall back to English). Characters are shown by default.
 
 ### System Tray Icon
 
@@ -127,6 +154,8 @@ What the app stores locally:
 - Language preference
 - Last update check time
 - Displayed model preferences
+- Bar style preference
+- Character preferences (shown/hidden, cat/dog/both)
 
 What it does **not** do:
 
