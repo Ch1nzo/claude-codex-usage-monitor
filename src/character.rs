@@ -1075,7 +1075,6 @@ struct Anim {
     leg_back_dx: i32,
     tail_dy: i32,
     blink: bool,
-    squash: i32,
 }
 
 fn anim_for(pose: Pose, frame: u64, blink_ctr: u32) -> Anim {
@@ -1086,7 +1085,6 @@ fn anim_for(pose: Pose, frame: u64, blink_ctr: u32) -> Anim {
         leg_back_dx: 0,
         tail_dy: 0,
         blink: false,
-        squash: 0,
     };
     match pose {
         Pose::Idle => {
@@ -1120,10 +1118,9 @@ fn anim_for(pose: Pose, frame: u64, blink_ctr: u32) -> Anim {
             a.tail_dy = if (frame / 2) % 2 == 0 { -2 } else { 0 };
         }
         Pose::Clicked => {
-            // quick jump + squash
+            // quick jump
             a.body_dy = -4;
             a.ear_dy = -2;
-            a.squash = 1;
             a.tail_dy = -3;
         }
     }
@@ -1184,8 +1181,6 @@ fn draw_character(
             );
         }
     }
-
-    let _ = anim.squash; // reserved for future squash/stretch tuning
 
     // Mood overlays on top of the face.
     let dy = anim.body_dy;
@@ -1453,14 +1448,13 @@ fn draw_bubble(
     // Center above the character, clamped to the window.
     let cx = (char_x_logical as i32 + SPRITE / 2) * u;
     let mut bx = (cx - bubble_w / 2).clamp(0, (w - bubble_w).max(0));
-    let mut by = 1 * u;
+    let by = u;
     // Avoid overlapping an existing bubble by shifting horizontally if needed.
     for (ux0, ux1) in used.iter() {
         if bx < *ux1 && bx + bubble_w > *ux0 {
             bx = (*ux1 + 2 * u).min((w - bubble_w).max(0));
         }
     }
-    let _ = &mut by;
     used.push((bx, bx + bubble_w));
 
     let bg = bgra(252, 252, 250);
