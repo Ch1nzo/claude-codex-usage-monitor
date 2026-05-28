@@ -1,11 +1,16 @@
-//! Pixel character system: a separate transparent, click-through, top-most
-//! window that floats just above the taskbar widget. It draws a roaming pixel
-//! cat and/or dog (composed from solid blocks straight into a 32-bit DIB so we
-//! get exact per-pixel alpha) and shows speech bubbles on usage-threshold
-//! events.
+//! Pixel character system: a separate top-most, layered window that floats just
+//! above the taskbar widget and shows a roaming pixel cat and/or dog.
 //!
-//! The drawing is intentionally isolated behind `draw_character` so the block
-//! art can later be swapped for PNG sprite sheets without touching the rest.
+//! The window is layered (UpdateLayeredWindow with per-pixel alpha) but NOT
+//! click-through, so mouse input is delivered only over the character's opaque
+//! pixels (Windows passes clicks through fully transparent pixels for layered
+//! windows automatically). That lets us support hover and click reactions while
+//! still letting the empty area click through to whatever is behind it.
+//!
+//! Sprites are composed from solid blocks straight into a 32-bit DIB on a 32x32
+//! logical grid, scaled by an integer factor for crisp (non-blurry) output. The
+//! art is isolated in `character_blocks` / `draw_character` so it can later be
+//! swapped for PNG sprite sheets without touching the rest.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -16,6 +21,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::localization::LanguageId;
@@ -23,19 +29,33 @@ use crate::native_interop;
 
 const CLASS_NAME: &str = "ClaudeCodexCharacter";
 const TIMER_ANIM: usize = 101;
-const ANIM_INTERVAL_MS: u32 = 120;
+const ANIM_INTERVAL_MS: u32 = 80;
+// Not exported by the windows crate's WindowsAndMessaging glob in this version.
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
-// Art is laid out on a unit grid; each unit is `u` device pixels.
-const GRID_W: i32 = 14;
-const GRID_H: i32 = 14;
-// Window is wider/taller than one character to allow roaming and a bubble.
-const WIN_UW: i32 = 64;
-const WIN_UH: i32 = 34;
+// Sprite is drawn on a 32x32 logical grid (the target render size at 96 DPI).
+const SPRITE: i32 = 32;
+// Window in logical pixels (room for two roaming characters + bubbles above).
+const WIN_LW: i32 = 184;
+const WIN_LH: i32 = 72;
+// Character baseline (top of sprite) in logical pixels.
+const BASE_OY: i32 = WIN_LH - SPRITE - 2;
 
-// Bubble visible duration in animation ticks (~120ms each).
-const BUBBLE_TTL: u32 = 42;
-// Minimum ticks between random idle encouragements.
-const IDLE_COOLDOWN: u64 = 250;
+// Timing (ticks of ANIM_INTERVAL_MS).
+const HOVER_DELAY_TICKS: u64 = 12; // ~1.0s before the hover message shows
+const CLICK_BUBBLE_TICKS: u32 = 31; // ~2.5s
+const CLICKED_POSE_TICKS: u32 = 6; // ~0.4s
+const HOVER_BUBBLE_TICKS: u32 = 36;
+const THRESHOLD_BUBBLE_TICKS: u32 = 50;
+const IDLE_BUBBLE_TICKS: u32 = 30;
+const FADE_TICKS: u32 = 4;
+const IDLE_COOLDOWN: u64 = 220;
+
+// Bubble priorities (higher wins; click must not override an active threshold).
+const PRI_IDLE: u8 = 0;
+const PRI_HOVER: u8 = 1;
+const PRI_CLICK: u8 = 2;
+const PRI_THRESHOLD: u8 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CharacterKind {
@@ -72,11 +92,37 @@ impl CharacterKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Trigger {
-    IdleEncourage,
-    SoftWarn,
-    UrgentWarn,
+enum Pose {
+    Idle,
+    Walk,
+    React,
+    Hover,
+    Clicked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pool {
+    Hover,
+    Click,
+    Idle,
+    Soft,
+    Urgent,
     Rest,
+    Encourage,
+}
+
+const POOL_COUNT: usize = 7;
+
+fn pool_index(p: Pool) -> usize {
+    match p {
+        Pool::Hover => 0,
+        Pool::Click => 1,
+        Pool::Idle => 2,
+        Pool::Soft => 3,
+        Pool::Urgent => 4,
+        Pool::Rest => 5,
+        Pool::Encourage => 6,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +145,60 @@ fn band_for(percent: f64) -> Band {
 struct Bubble {
     text: String,
     ttl: u32,
+    max_ttl: u32,
+    pri: u8,
+}
+
+struct Critter {
+    is_cat: bool,
+    variant: u8,
+    x: f32,
+    dir: f32,
+    moving: bool,
+    move_ticks: u32,
+    pose: Pose,
+    clicked_ticks: u32,
+    react_ticks: u32,
+    hovering: bool,
+    hover_since: Option<u64>,
+    blink_ctr: u32,
+    bubble: Option<Bubble>,
+    last_idx: [i32; POOL_COUNT],
+}
+
+impl Critter {
+    fn new(is_cat: bool, variant: u8, x: f32, dir: f32) -> Self {
+        Self {
+            is_cat,
+            variant,
+            x,
+            dir,
+            moving: true,
+            move_ticks: 0,
+            pose: Pose::Walk,
+            clicked_ticks: 0,
+            react_ticks: 0,
+            hovering: false,
+            hover_since: None,
+            blink_ctr: 0,
+            bubble: None,
+            last_idx: [-1; POOL_COUNT],
+        }
+    }
+
+    fn pose_now(&self) -> Pose {
+        if self.clicked_ticks > 0 {
+            Pose::Clicked
+        } else if self.hovering {
+            Pose::Hover
+        } else if self.react_ticks > 0 {
+            Pose::React
+        } else if self.moving {
+            Pose::Walk
+        } else {
+            Pose::Idle
+        }
+    }
 }
 
 struct CharState {
@@ -106,18 +206,15 @@ struct CharState {
     enabled: bool,
     kind: CharacterKind,
     lang: LanguageId,
-    u: i32,
+    uscale: i32,
     win_w: i32,
     win_h: i32,
     frame: u64,
-    cat_x: f32,
-    cat_dir: f32,
-    dog_x: f32,
-    dog_dir: f32,
-    bubble: Option<Bubble>,
-    react_ticks: u32,
+    cat: Critter,
+    dog: Critter,
     last_band: Band,
     last_idle_frame: u64,
+    tracking_leave: bool,
 }
 
 static STATE: Mutex<Option<CharState>> = Mutex::new(None);
@@ -130,7 +227,7 @@ fn rng_next() -> u64 {
         x = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x9E3779B97F4A7C15)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15)
             | 1;
     }
     x ^= x << 13;
@@ -140,23 +237,53 @@ fn rng_next() -> u64 {
     x
 }
 
-fn pick(pool: &[&'static str]) -> &'static str {
-    if pool.is_empty() {
-        return "";
+/// Pick a random message from the pool without repeating the previous one.
+fn pick_message(critter: &mut Critter, lang: LanguageId, pool: Pool) -> String {
+    let msgs = message_pool(lang, critter.is_cat, pool);
+    if msgs.is_empty() {
+        return String::new();
     }
-    pool[(rng_next() as usize) % pool.len()]
+    if msgs.len() == 1 {
+        return msgs[0].to_string();
+    }
+    let slot = pool_index(pool);
+    let last = critter.last_idx[slot];
+    let mut idx = (rng_next() as usize % msgs.len()) as i32;
+    if idx == last {
+        idx = ((idx as usize + 1) % msgs.len()) as i32;
+    }
+    critter.last_idx[slot] = idx;
+    msgs[idx as usize].to_string()
 }
 
-/// Create (once) and show the character window. Safe to call again to update
-/// the enabled state / kind / anchor.
+fn set_bubble(critter: &mut Critter, text: String, ttl: u32, pri: u8) {
+    // Don't let a lower-priority message replace a still-visible higher one.
+    if let Some(b) = critter.bubble.as_ref() {
+        if b.ttl > 0 && b.pri > pri {
+            return;
+        }
+    }
+    if text.is_empty() {
+        return;
+    }
+    critter.bubble = Some(Bubble {
+        text,
+        ttl,
+        max_ttl: ttl,
+        pri,
+    });
+}
+
+/// Create (once) and show the character window. Safe to call again to refresh
+/// the enabled state / kind / language / anchor.
 pub fn init(anchor: RECT, enabled: bool, kind: CharacterKind, lang: LanguageId) {
     {
         let guard = STATE.lock().unwrap();
         if guard.is_some() {
             drop(guard);
-            set_enabled(enabled);
             set_kind(kind);
             set_language(lang);
+            set_enabled(enabled);
             reposition(anchor);
             return;
         }
@@ -169,7 +296,7 @@ pub fn init(anchor: RECT, enabled: bool, kind: CharacterKind, lang: LanguageId) 
         let class = native_interop::wide_str(CLASS_NAME);
         let title = native_interop::wide_str("Claude & Codex Character");
         CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             PCWSTR::from_raw(class.as_ptr()),
             PCWSTR::from_raw(title.as_ptr()),
             WS_POPUP,
@@ -184,40 +311,35 @@ pub fn init(anchor: RECT, enabled: bool, kind: CharacterKind, lang: LanguageId) 
         )
         .unwrap_or_default()
     };
-
     if hwnd.is_invalid() {
         return;
     }
 
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     let dpi = if dpi == 0 { 96 } else { dpi };
-    let u = ((4 * dpi as i32) / 96).max(3);
-    let win_w = WIN_UW * u;
-    let win_h = WIN_UH * u;
+    let uscale = ((dpi as i32 + 48) / 96).max(1);
+    let win_w = WIN_LW * uscale;
+    let win_h = WIN_LH * uscale;
 
+    let max_x = (WIN_LW - SPRITE) as f32;
     let state = CharState {
         hwnd: hwnd.0 as isize,
         enabled,
         kind,
         lang,
-        u,
+        uscale,
         win_w,
         win_h,
         frame: 0,
-        cat_x: 2.0,
-        cat_dir: 1.0,
-        dog_x: (WIN_UW - GRID_W - 2) as f32,
-        dog_dir: -1.0,
-        bubble: None,
-        react_ticks: 0,
+        cat: Critter::new(true, 0, 8.0, 1.0),
+        dog: Critter::new(false, 0, max_x - 8.0, -1.0),
         last_band: Band::Low,
         last_idle_frame: 0,
+        tracking_leave: false,
     };
-
     *STATE.lock().unwrap() = Some(state);
 
     reposition(anchor);
-
     if enabled {
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -257,7 +379,6 @@ pub fn set_enabled(enabled: bool) {
         s.enabled = enabled;
         HWND(s.hwnd as *mut _)
     };
-
     unsafe {
         if enabled {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -311,7 +432,6 @@ pub fn current_kind() -> CharacterKind {
         .unwrap_or(CharacterKind::Cat)
 }
 
-/// Place the window just above the supplied widget rectangle (screen coords).
 pub fn reposition(anchor: RECT) {
     let (hwnd, win_w, win_h, enabled) = {
         let guard = STATE.lock().unwrap();
@@ -320,7 +440,6 @@ pub fn reposition(anchor: RECT) {
         };
         (HWND(s.hwnd as *mut _), s.win_w, s.win_h, s.enabled)
     };
-
     let x = anchor.left;
     let y = anchor.top - win_h;
     unsafe {
@@ -341,31 +460,40 @@ pub fn on_usage_update(max_percent: f64, lang: LanguageId) {
     }
 
     let band = band_for(max_percent);
-    let trigger = match (s.last_band, band) {
-        (prev, Band::Urgent) if prev != Band::Urgent => Some(Trigger::UrgentWarn),
-        (prev, Band::Soft) if prev == Band::Low => Some(Trigger::SoftWarn),
-        (prev, Band::Low) if prev != Band::Low => Some(Trigger::Rest),
+    let (pool, do_react) = match (s.last_band, band) {
+        (prev, Band::Urgent) if prev != Band::Urgent => (Some(Pool::Urgent), true),
+        (Band::Low, Band::Soft) => (Some(Pool::Soft), true),
+        (prev, Band::Low) if prev != Band::Low => (Some(Pool::Rest), false),
         (Band::Low, Band::Low) => {
-            if s.frame.saturating_sub(s.last_idle_frame) >= IDLE_COOLDOWN
-                && rng_next() % 5 == 0
-            {
+            if s.frame.saturating_sub(s.last_idle_frame) >= IDLE_COOLDOWN && rng_next() % 4 == 0 {
                 s.last_idle_frame = s.frame;
-                Some(Trigger::IdleEncourage)
+                (Some(Pool::Encourage), false)
             } else {
-                None
+                (None, false)
             }
         }
-        _ => None,
+        _ => (None, false),
     };
     s.last_band = band;
 
-    if let Some(trigger) = trigger {
-        let text = pick(message_pool(s.lang, trigger)).to_string();
-        s.bubble = Some(Bubble {
-            text,
-            ttl: BUBBLE_TTL,
-        });
-        s.react_ticks = 8;
+    if let Some(pool) = pool {
+        let lang = s.lang;
+        let kind = s.kind;
+        // Show on whichever characters are visible.
+        if kind.shows_cat() {
+            let text = pick_message(&mut s.cat, lang, pool);
+            set_bubble(&mut s.cat, text, THRESHOLD_BUBBLE_TICKS, PRI_THRESHOLD);
+            if do_react {
+                s.cat.react_ticks = 12;
+            }
+        }
+        if kind.shows_dog() {
+            let text = pick_message(&mut s.dog, lang, pool);
+            set_bubble(&mut s.dog, text, THRESHOLD_BUBBLE_TICKS, PRI_THRESHOLD);
+            if do_react {
+                s.dog.react_ticks = 12;
+            }
+        }
     }
 }
 
@@ -383,6 +511,8 @@ pub fn destroy() {
     }
 }
 
+// ----- window proc & input ---------------------------------------------------
+
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -396,11 +526,139 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
+        WM_MOUSEMOVE => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            on_mouse_move(hwnd, x, y);
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            on_mouse_leave();
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            on_click(x, y);
+            LRESULT(0)
+        }
         WM_DESTROY => {
             KillTimer(hwnd, TIMER_ANIM).ok();
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Character bounding box in client device pixels.
+fn critter_bounds(c: &Critter, uscale: i32) -> (i32, i32, i32, i32) {
+    let left = (c.x * uscale as f32) as i32;
+    let top = BASE_OY * uscale;
+    (left, top, SPRITE * uscale, SPRITE * uscale)
+}
+
+fn point_in(c: &Critter, uscale: i32, x: i32, y: i32) -> bool {
+    let (l, t, w, h) = critter_bounds(c, uscale);
+    x >= l && x < l + w && y >= t && y < t + h
+}
+
+fn on_mouse_move(hwnd: HWND, x: i32, y: i32) {
+    let mut guard = STATE.lock().unwrap();
+    let Some(s) = guard.as_mut() else {
+        return;
+    };
+    if !s.tracking_leave {
+        unsafe {
+            let mut tme = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut tme);
+        }
+        s.tracking_leave = true;
+    }
+
+    let uscale = s.uscale;
+    let frame = s.frame;
+    let kind = s.kind;
+    let mut changed = false;
+    if kind.shows_cat() {
+        let over = point_in(&s.cat, uscale, x, y);
+        changed |= update_hover(&mut s.cat, over, frame);
+    }
+    if kind.shows_dog() {
+        let over = point_in(&s.dog, uscale, x, y);
+        changed |= update_hover(&mut s.dog, over, frame);
+    }
+    if changed {
+        drop(guard);
+        render();
+    }
+}
+
+fn update_hover(c: &mut Critter, over: bool, frame: u64) -> bool {
+    if over && !c.hovering {
+        c.hovering = true;
+        c.hover_since = Some(frame);
+        true
+    } else if !over && c.hovering {
+        c.hovering = false;
+        c.hover_since = None;
+        true
+    } else {
+        false
+    }
+}
+
+fn on_mouse_leave() {
+    let mut guard = STATE.lock().unwrap();
+    let Some(s) = guard.as_mut() else {
+        return;
+    };
+    s.tracking_leave = false;
+    let mut changed = false;
+    if s.cat.hovering {
+        s.cat.hovering = false;
+        s.cat.hover_since = None;
+        changed = true;
+    }
+    if s.dog.hovering {
+        s.dog.hovering = false;
+        s.dog.hover_since = None;
+        changed = true;
+    }
+    if changed {
+        drop(guard);
+        render();
+    }
+}
+
+fn on_click(x: i32, y: i32) {
+    let mut guard = STATE.lock().unwrap();
+    let Some(s) = guard.as_mut() else {
+        return;
+    };
+    let uscale = s.uscale;
+    let kind = s.kind;
+    let lang = s.lang;
+    let mut hit = false;
+    if kind.shows_cat() && point_in(&s.cat, uscale, x, y) {
+        s.cat.clicked_ticks = CLICKED_POSE_TICKS;
+        let text = pick_message(&mut s.cat, lang, Pool::Click);
+        set_bubble(&mut s.cat, text, CLICK_BUBBLE_TICKS, PRI_CLICK);
+        hit = true;
+    }
+    if kind.shows_dog() && point_in(&s.dog, uscale, x, y) {
+        s.dog.clicked_ticks = CLICKED_POSE_TICKS;
+        let text = pick_message(&mut s.dog, lang, Pool::Click);
+        set_bubble(&mut s.dog, text, CLICK_BUBBLE_TICKS, PRI_CLICK);
+        hit = true;
+    }
+    if hit {
+        drop(guard);
+        render();
     }
 }
 
@@ -414,43 +672,89 @@ fn tick() {
             return;
         }
         s.frame = s.frame.wrapping_add(1);
+        let frame = s.frame;
+        let lang = s.lang;
+        let max_x = (WIN_LW - SPRITE) as f32;
 
-        let max_x = (WIN_UW - GRID_W) as f32;
-        let speed = 0.35_f32;
-        if s.kind.shows_cat() {
-            s.cat_x += s.cat_dir * speed;
-            if s.cat_x <= 0.0 {
-                s.cat_x = 0.0;
-                s.cat_dir = 1.0;
-            } else if s.cat_x >= max_x {
-                s.cat_x = max_x;
-                s.cat_dir = -1.0;
-            }
+        let kind = s.kind;
+        if kind.shows_cat() {
+            step_critter(&mut s.cat, frame, lang, max_x, 0.55);
         }
-        if s.kind.shows_dog() {
-            s.dog_x += s.dog_dir * speed * 0.9;
-            if s.dog_x <= 0.0 {
-                s.dog_x = 0.0;
-                s.dog_dir = 1.0;
-            } else if s.dog_x >= max_x {
-                s.dog_x = max_x;
-                s.dog_dir = -1.0;
-            }
-        }
-
-        if s.react_ticks > 0 {
-            s.react_ticks -= 1;
-        }
-        if let Some(b) = s.bubble.as_mut() {
-            if b.ttl > 0 {
-                b.ttl -= 1;
-            }
-            if b.ttl == 0 {
-                s.bubble = None;
-            }
+        if kind.shows_dog() {
+            step_critter(&mut s.dog, frame, lang, max_x, 0.7);
         }
     }
     render();
+}
+
+fn step_critter(c: &mut Critter, frame: u64, lang: LanguageId, max_x: f32, speed: f32) {
+    // Transient pose timers.
+    if c.clicked_ticks > 0 {
+        c.clicked_ticks -= 1;
+    }
+    if c.react_ticks > 0 {
+        c.react_ticks -= 1;
+    }
+
+    // Hover bubble after the dwell delay.
+    if c.hovering {
+        if let Some(since) = c.hover_since {
+            if frame.saturating_sub(since) == HOVER_DELAY_TICKS {
+                let text = pick_message(c, lang, Pool::Hover);
+                set_bubble(c, text, HOVER_BUBBLE_TICKS, PRI_HOVER);
+            }
+        }
+    }
+
+    // Idle <-> walk cycling (don't move while hovering or clicked).
+    let frozen = c.hovering || c.clicked_ticks > 0;
+    if !frozen {
+        if c.move_ticks == 0 {
+            c.moving = !c.moving;
+            c.move_ticks = if c.moving {
+                40 + (rng_next() % 60) as u32
+            } else {
+                20 + (rng_next() % 30) as u32
+            };
+            if c.moving && rng_next() % 2 == 0 {
+                c.dir = -c.dir;
+            }
+        }
+        c.move_ticks -= 1;
+        if c.moving {
+            c.x += c.dir * speed;
+            if c.x <= 0.0 {
+                c.x = 0.0;
+                c.dir = 1.0;
+            } else if c.x >= max_x {
+                c.x = max_x;
+                c.dir = -1.0;
+            }
+        }
+    }
+
+    // Blink counter (used by idle pose).
+    if c.blink_ctr == 0 {
+        c.blink_ctr = 30 + (rng_next() % 40) as u32;
+    }
+    c.blink_ctr -= 1;
+
+    c.pose = c.pose_now();
+
+    // Occasional idle chatter when standing still and quiet.
+    if c.pose == Pose::Idle && c.bubble.is_none() && rng_next() % 220 == 0 {
+        let text = pick_message(c, lang, Pool::Idle);
+        set_bubble(c, text, IDLE_BUBBLE_TICKS, PRI_IDLE);
+    }
+
+    if let Some(b) = c.bubble.as_mut() {
+        if b.ttl > 0 {
+            b.ttl -= 1;
+        }
+        if b.ttl == 0 {
+            c.bubble = None;
+        }
+    }
 }
 
 // ----- rendering -------------------------------------------------------------
@@ -465,95 +769,237 @@ fn fill_block(bits: &mut [u32], w: i32, h: i32, x: i32, y: i32, bw: i32, bh: i32
         if yy < 0 || yy >= h {
             continue;
         }
+        let row = yy * w;
         for xx in x..(x + bw) {
             if xx < 0 || xx >= w {
                 continue;
             }
-            bits[(yy * w + xx) as usize] = color;
+            bits[(row + xx) as usize] = color;
         }
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Part {
     Body,
+    Dark,
     Light,
     Eye,
+    EyeHi,
     Nose,
+    Mouth,
     Ear,
+    Collar,
+    Buckle,
 }
 
-fn palette(kind_is_cat: bool, part: Part) -> u32 {
-    if kind_is_cat {
-        match part {
-            Part::Body => bgra(150, 154, 160),
-            Part::Light => bgra(215, 218, 221),
-            Part::Eye => bgra(40, 40, 45),
-            Part::Nose => bgra(220, 140, 150),
-            Part::Ear => bgra(230, 170, 180),
-        }
-    } else {
-        match part {
-            Part::Body => bgra(196, 150, 98),
-            Part::Light => bgra(228, 210, 176),
-            Part::Eye => bgra(50, 40, 35),
-            Part::Nose => bgra(60, 45, 40),
-            Part::Ear => bgra(150, 110, 70),
-        }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tag {
+    None,
+    Ear,
+    LegFront,
+    LegBack,
+    Eyes,
+    Tail,
+}
+
+fn palette(is_cat: bool, variant: u8, part: Part) -> u32 {
+    // Shared feature colors.
+    match part {
+        Part::Eye => return bgra(40, 38, 45),
+        Part::EyeHi => return bgra(255, 255, 255),
+        Part::Mouth => return bgra(70, 55, 55),
+        Part::Collar => return bgra(210, 70, 70),
+        Part::Buckle => return bgra(240, 210, 90),
+        _ => {}
     }
-}
-
-/// Block layout (ux, uy, uw, uh, part) for a character facing right.
-fn character_blocks(is_cat: bool, leg_phase: bool) -> Vec<(i32, i32, i32, i32, Part)> {
-    let mut v: Vec<(i32, i32, i32, i32, Part)> = Vec::new();
     if is_cat {
-        // pointy ears
-        v.push((2, 0, 2, 3, Part::Body));
-        v.push((10, 0, 2, 3, Part::Body));
-        v.push((2, 1, 1, 1, Part::Ear));
-        v.push((11, 1, 1, 1, Part::Ear));
-        // head
-        v.push((2, 3, 10, 7, Part::Body));
-        // eyes
-        v.push((4, 5, 2, 2, Part::Eye));
-        v.push((8, 5, 2, 2, Part::Eye));
-        // nose
-        v.push((6, 7, 2, 1, Part::Nose));
-        // body + belly
-        v.push((3, 10, 8, 3, Part::Body));
-        v.push((5, 11, 4, 2, Part::Light));
-        // tail (left)
-        v.push((0, 8, 2, 1, Part::Body));
-        v.push((0, 7, 1, 2, Part::Body));
+        // variant 0: orange tabby, variant 1: grey
+        let (body, dark, light, ear, nose) = if variant == 0 {
+            (
+                bgra(235, 160, 80),
+                bgra(200, 120, 50),
+                bgra(250, 205, 140),
+                bgra(240, 175, 185),
+                bgra(220, 120, 130),
+            )
+        } else {
+            (
+                bgra(150, 154, 160),
+                bgra(110, 114, 122),
+                bgra(205, 208, 214),
+                bgra(235, 180, 188),
+                bgra(210, 130, 140),
+            )
+        };
+        match part {
+            Part::Body => body,
+            Part::Dark => dark,
+            Part::Light => light,
+            Part::Ear => ear,
+            Part::Nose => nose,
+            _ => body,
+        }
     } else {
-        // floppy ears
-        v.push((1, 2, 2, 5, Part::Ear));
-        v.push((11, 2, 2, 5, Part::Ear));
-        // head
-        v.push((3, 2, 8, 8, Part::Body));
-        // snout
-        v.push((4, 7, 6, 3, Part::Light));
-        // eyes
-        v.push((5, 4, 2, 2, Part::Eye));
-        v.push((8, 4, 2, 2, Part::Eye));
-        // nose
-        v.push((6, 7, 2, 2, Part::Nose));
-        // body + belly
-        v.push((3, 10, 8, 3, Part::Body));
-        v.push((5, 11, 4, 2, Part::Light));
-        // tail (left)
-        v.push((0, 9, 2, 1, Part::Body));
-        v.push((0, 8, 1, 2, Part::Body));
+        // variant 0: brown, variant 1: black
+        let (body, dark, light, ear, nose) = if variant == 0 {
+            (
+                bgra(184, 134, 84),
+                bgra(140, 95, 55),
+                bgra(222, 188, 142),
+                bgra(150, 105, 65),
+                bgra(60, 45, 42),
+            )
+        } else {
+            (
+                bgra(92, 92, 100),
+                bgra(58, 58, 66),
+                bgra(140, 140, 150),
+                bgra(70, 70, 78),
+                bgra(40, 38, 42),
+            )
+        };
+        match part {
+            Part::Body => body,
+            Part::Dark => dark,
+            Part::Light => light,
+            Part::Ear => ear,
+            Part::Nose => nose,
+            _ => body,
+        }
     }
-    // legs (alternate for a simple walk cycle)
-    if leg_phase {
-        v.push((3, 13, 2, 1, Part::Body));
-        v.push((9, 13, 2, 1, Part::Body));
+}
+
+/// Block layout (lx, ly, lw, lh, part, tag) for a character facing right on the
+/// 32x32 grid.
+fn character_blocks(is_cat: bool) -> Vec<(i32, i32, i32, i32, Part, Tag)> {
+    let mut v: Vec<(i32, i32, i32, i32, Part, Tag)> = Vec::new();
+    if is_cat {
+        // tail
+        v.push((2, 14, 3, 2, Part::Body, Tag::Tail));
+        v.push((1, 10, 2, 5, Part::Body, Tag::Tail));
+        v.push((1, 9, 2, 2, Part::Dark, Tag::Tail));
+        // ears
+        v.push((6, 2, 5, 5, Part::Body, Tag::Ear));
+        v.push((21, 2, 5, 5, Part::Body, Tag::Ear));
+        v.push((8, 3, 2, 2, Part::Ear, Tag::Ear));
+        v.push((22, 3, 2, 2, Part::Ear, Tag::Ear));
+        // head
+        v.push((6, 5, 20, 14, Part::Body, Tag::None));
+        v.push((7, 6, 7, 3, Part::Light, Tag::None)); // top-left highlight
+        v.push((8, 16, 16, 2, Part::Dark, Tag::None)); // chin shade
+        v.push((11, 13, 10, 5, Part::Light, Tag::None)); // muzzle
+        // eyes
+        v.push((11, 9, 3, 4, Part::Eye, Tag::Eyes));
+        v.push((19, 9, 3, 4, Part::Eye, Tag::Eyes));
+        v.push((12, 9, 1, 1, Part::EyeHi, Tag::Eyes));
+        v.push((20, 9, 1, 1, Part::EyeHi, Tag::Eyes));
+        // nose + mouth
+        v.push((15, 13, 2, 2, Part::Nose, Tag::None));
+        v.push((14, 15, 1, 1, Part::Mouth, Tag::None));
+        v.push((17, 15, 1, 1, Part::Mouth, Tag::None));
+        // body
+        v.push((9, 19, 14, 9, Part::Body, Tag::None));
+        v.push((12, 22, 8, 5, Part::Light, Tag::None)); // belly
+        // collar
+        v.push((9, 19, 14, 2, Part::Collar, Tag::None));
+        v.push((15, 19, 2, 2, Part::Buckle, Tag::None));
+        // legs
+        v.push((10, 28, 4, 3, Part::Body, Tag::LegBack));
+        v.push((18, 28, 4, 3, Part::Body, Tag::LegFront));
     } else {
-        v.push((4, 13, 2, 1, Part::Body));
-        v.push((8, 13, 2, 1, Part::Body));
+        // tail
+        v.push((26, 16, 3, 2, Part::Body, Tag::Tail));
+        v.push((28, 12, 2, 5, Part::Body, Tag::Tail));
+        // floppy ears
+        v.push((4, 5, 5, 10, Part::Ear, Tag::Ear));
+        v.push((23, 5, 5, 10, Part::Ear, Tag::Ear));
+        // head
+        v.push((7, 4, 18, 15, Part::Body, Tag::None));
+        v.push((8, 5, 7, 3, Part::Light, Tag::None));
+        v.push((11, 13, 11, 6, Part::Light, Tag::None)); // snout
+        v.push((9, 16, 14, 2, Part::Dark, Tag::None));
+        // eyes
+        v.push((12, 8, 3, 4, Part::Eye, Tag::Eyes));
+        v.push((18, 8, 3, 4, Part::Eye, Tag::Eyes));
+        v.push((13, 8, 1, 1, Part::EyeHi, Tag::Eyes));
+        v.push((19, 8, 1, 1, Part::EyeHi, Tag::Eyes));
+        // nose + mouth
+        v.push((15, 13, 3, 3, Part::Nose, Tag::None));
+        v.push((13, 18, 6, 1, Part::Mouth, Tag::None));
+        // body
+        v.push((9, 19, 14, 9, Part::Body, Tag::None));
+        v.push((12, 22, 8, 5, Part::Light, Tag::None));
+        // collar
+        v.push((9, 19, 14, 2, Part::Collar, Tag::None));
+        v.push((15, 19, 2, 2, Part::Buckle, Tag::None));
+        // legs
+        v.push((10, 28, 4, 3, Part::Body, Tag::LegBack));
+        v.push((18, 28, 4, 3, Part::Body, Tag::LegFront));
     }
     v
+}
+
+struct Anim {
+    body_dy: i32,
+    ear_dy: i32,
+    leg_front_dx: i32,
+    leg_back_dx: i32,
+    tail_dy: i32,
+    blink: bool,
+    squash: i32,
+}
+
+fn anim_for(pose: Pose, frame: u64, blink_ctr: u32) -> Anim {
+    let mut a = Anim {
+        body_dy: 0,
+        ear_dy: 0,
+        leg_front_dx: 0,
+        leg_back_dx: 0,
+        tail_dy: 0,
+        blink: false,
+        squash: 0,
+    };
+    match pose {
+        Pose::Idle => {
+            // gentle breathing bob + occasional blink
+            a.body_dy = if (frame / 6) % 2 == 0 { 0 } else { 1 };
+            a.blink = blink_ctr < 2;
+            a.tail_dy = if (frame / 8) % 2 == 0 { 0 } else { -1 };
+        }
+        Pose::Walk => {
+            // 4-frame leg cycle + bob
+            let phase = (frame / 2) % 4;
+            let (f, b) = match phase {
+                0 => (2, -2),
+                1 => (0, 0),
+                2 => (-2, 2),
+                _ => (0, 0),
+            };
+            a.leg_front_dx = f;
+            a.leg_back_dx = b;
+            a.body_dy = if phase % 2 == 0 { 0 } else { 1 };
+            a.tail_dy = if (frame / 3) % 2 == 0 { -1 } else { 0 };
+        }
+        Pose::React => {
+            a.ear_dy = -2;
+            a.tail_dy = if (frame / 2) % 2 == 0 { -3 } else { -1 }; // wag
+            a.body_dy = if (frame / 3) % 2 == 0 { 0 } else { 1 };
+        }
+        Pose::Hover => {
+            a.ear_dy = -1;
+            a.body_dy = if (frame / 4) % 2 == 0 { 0 } else { 1 };
+            a.tail_dy = if (frame / 2) % 2 == 0 { -2 } else { 0 };
+        }
+        Pose::Clicked => {
+            // quick jump + squash
+            a.body_dy = -4;
+            a.ear_dy = -2;
+            a.squash = 1;
+            a.tail_dy = -3;
+        }
+    }
+    a
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -562,21 +1008,68 @@ fn draw_character(
     w: i32,
     h: i32,
     is_cat: bool,
+    variant: u8,
     ox: i32,
     oy: i32,
     u: i32,
     mirror: bool,
-    leg_phase: bool,
+    anim: &Anim,
 ) {
-    for (ux, uy, uw, uh, part) in character_blocks(is_cat, leg_phase) {
-        let ax = if mirror { GRID_W - ux - uw } else { ux };
-        let color = palette(is_cat, part);
-        fill_block(bits, w, h, ox + ax * u, oy + uy * u, uw * u, uh * u, color);
+    for (lx, ly, lw, lh, part, tag) in character_blocks(is_cat) {
+        if anim.blink && tag == Tag::Eyes {
+            continue; // eyes closed; eyelid drawn below
+        }
+        let mut x = lx;
+        let mut y = ly;
+        match tag {
+            Tag::Ear => y += anim.ear_dy,
+            Tag::LegFront => x += anim.leg_front_dx,
+            Tag::LegBack => x += anim.leg_back_dx,
+            Tag::Tail => y += anim.tail_dy,
+            _ => {}
+        }
+        // global body bob (legs stay planted)
+        if !matches!(tag, Tag::LegFront | Tag::LegBack) {
+            y += anim.body_dy;
+        }
+        let ax = if mirror { SPRITE - x - lw } else { x };
+        let color = palette(is_cat, variant, part);
+        fill_block(bits, w, h, ox + ax * u, oy + y * u, lw * u, lh * u, color);
     }
+
+    if anim.blink {
+        // closed-eye line
+        let eye_color = palette(is_cat, variant, Part::Dark);
+        let (e1, e2, ey) = if is_cat { (11, 19, 11) } else { (12, 18, 10) };
+        for ex in [e1, e2] {
+            let ax = if mirror { SPRITE - ex - 3 } else { ex };
+            fill_block(
+                bits,
+                w,
+                h,
+                ox + ax * u,
+                oy + (ey + anim.body_dy) * u,
+                3 * u,
+                u,
+                eye_color,
+            );
+        }
+    }
+
+    let _ = anim.squash; // reserved for future squash/stretch tuning
 }
 
 fn render() {
-    let (hwnd, win_w, win_h, u, kind, cat_x, cat_dir, dog_x, dog_dir, frame, bubble_text, react) = {
+    let (
+        hwnd,
+        win_w,
+        win_h,
+        u,
+        kind,
+        frame,
+        cat_snapshot,
+        dog_snapshot,
+    ) = {
         let guard = STATE.lock().unwrap();
         let Some(s) = guard.as_ref() else {
             return;
@@ -588,15 +1081,11 @@ fn render() {
             HWND(s.hwnd as *mut _),
             s.win_w,
             s.win_h,
-            s.u,
+            s.uscale,
             s.kind,
-            s.cat_x,
-            s.cat_dir,
-            s.dog_x,
-            s.dog_dir,
             s.frame,
-            s.bubble.as_ref().map(|b| b.text.clone()),
-            s.react_ticks > 0,
+            snapshot(&s.cat),
+            snapshot(&s.dog),
         )
     };
 
@@ -606,7 +1095,7 @@ fn render() {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
                 biWidth: win_w,
-                biHeight: -win_h, // top-down
+                biHeight: -win_h,
                 biPlanes: 1,
                 biBitCount: 32,
                 biCompression: 0,
@@ -614,7 +1103,6 @@ fn render() {
             },
             ..Default::default()
         };
-
         let mut bits_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let mem_dc = CreateCompatibleDC(screen_dc);
         let dib = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0)
@@ -628,47 +1116,78 @@ fn render() {
 
         let pixel_count = (win_w * win_h) as usize;
         let bits = std::slice::from_raw_parts_mut(bits_ptr as *mut u32, pixel_count);
-        // Transparent background.
         for px in bits.iter_mut() {
             *px = 0;
         }
 
-        // Vertical bob: 0 or 1 unit, larger while reacting.
-        let bob = if react {
-            if (frame / 2) % 2 == 0 {
-                0
-            } else {
-                2 * u
-            }
-        } else if (frame / 4) % 2 == 0 {
-            0
-        } else {
-            u
-        };
-        let base_oy = win_h - (GRID_H + 1) * u - bob;
-        let leg_phase = (frame / 3) % 2 == 0;
-
+        let base_oy = BASE_OY * u;
         if kind.shows_cat() {
-            let ox = (cat_x * u as f32) as i32;
-            draw_character(bits, win_w, win_h, true, ox, base_oy, u, cat_dir < 0.0, leg_phase);
+            let ox = (cat_snapshot.x * u as f32) as i32;
+            let anim = anim_for(cat_snapshot.pose, frame, cat_snapshot.blink_ctr);
+            draw_character(
+                bits,
+                win_w,
+                win_h,
+                true,
+                cat_snapshot.variant,
+                ox,
+                base_oy,
+                u,
+                cat_snapshot.dir < 0.0,
+                &anim,
+            );
         }
         if kind.shows_dog() {
-            let ox = (dog_x * u as f32) as i32;
+            let ox = (dog_snapshot.x * u as f32) as i32;
+            let anim = anim_for(dog_snapshot.pose, frame, dog_snapshot.blink_ctr);
             draw_character(
                 bits,
                 win_w,
                 win_h,
                 false,
+                dog_snapshot.variant,
                 ox,
                 base_oy,
                 u,
-                dog_dir < 0.0,
-                !leg_phase,
+                dog_snapshot.dir < 0.0,
+                &anim,
             );
         }
 
-        if let Some(text) = bubble_text {
-            draw_bubble(mem_dc, bits, win_w, win_h, u, &text);
+        // Bubbles (drawn after characters so they sit on top). When both are
+        // visible, the dog bubble is nudged up so they don't overlap.
+        let mut bubble_rows_used: Vec<(i32, i32)> = Vec::new();
+        if kind.shows_cat() {
+            if let Some(b) = &cat_snapshot.bubble {
+                draw_bubble(
+                    mem_dc,
+                    bits,
+                    win_w,
+                    win_h,
+                    u,
+                    cat_snapshot.x,
+                    &b.text,
+                    b.ttl,
+                    b.max_ttl,
+                    &mut bubble_rows_used,
+                );
+            }
+        }
+        if kind.shows_dog() {
+            if let Some(b) = &dog_snapshot.bubble {
+                draw_bubble(
+                    mem_dc,
+                    bits,
+                    win_w,
+                    win_h,
+                    u,
+                    dog_snapshot.x,
+                    &b.text,
+                    b.ttl,
+                    b.max_ttl,
+                    &mut bubble_rows_used,
+                );
+            }
         }
 
         let pt_src = POINT { x: 0, y: 0 };
@@ -680,7 +1199,7 @@ fn render() {
             BlendOp: 0,
             BlendFlags: 0,
             SourceConstantAlpha: 255,
-            AlphaFormat: 1, // AC_SRC_ALPHA
+            AlphaFormat: 1,
         };
         let _ = UpdateLayeredWindow(
             hwnd,
@@ -701,42 +1220,89 @@ fn render() {
     }
 }
 
-/// Draw a rounded speech bubble in the top area. The background is written
-/// directly (opaque), the text via GDI, then the whole bubble rect is forced to
-/// alpha 255 so the GDI text (which leaves the alpha byte at 0) stays visible.
-fn draw_bubble(mem_dc: HDC, bits: &mut [u32], w: i32, _h: i32, u: i32, text: &str) {
-    let pad = u;
-    let bubble_h = 6 * u;
-    let bubble_w = (w - 4 * u).max(8 * u);
-    let bx = 2 * u;
-    let by = u;
+struct Snapshot {
+    x: f32,
+    dir: f32,
+    pose: Pose,
+    variant: u8,
+    blink_ctr: u32,
+    bubble: Option<BubbleSnap>,
+}
 
-    let bg = bgra(250, 250, 250);
-    let border = bgra(120, 120, 120);
+struct BubbleSnap {
+    text: String,
+    ttl: u32,
+    max_ttl: u32,
+}
 
-    // Border then inner fill (simple 1-unit border).
-    fill_block(bits, w, _h, bx, by, bubble_w, bubble_h, border);
-    fill_block(
-        bits,
-        w,
-        _h,
-        bx + 1,
-        by + 1,
-        bubble_w - 2,
-        bubble_h - 2,
-        bg,
-    );
-    // Little tail pointing down toward the character.
-    fill_block(bits, w, _h, bx + 3 * u, by + bubble_h, u, u, bg);
+fn snapshot(c: &Critter) -> Snapshot {
+    Snapshot {
+        x: c.x,
+        dir: c.dir,
+        pose: c.pose,
+        variant: c.variant,
+        blink_ctr: c.blink_ctr,
+        bubble: c.bubble.as_ref().map(|b| BubbleSnap {
+            text: b.text.clone(),
+            ttl: b.ttl,
+            max_ttl: b.max_ttl,
+        }),
+    }
+}
+
+/// Premultiply RGB by alpha for the ULW_ALPHA blend during fade-out.
+#[inline]
+fn premul(color: u32, alpha: u32) -> u32 {
+    let r = ((color >> 16) & 0xFF) * alpha / 255;
+    let g = ((color >> 8) & 0xFF) * alpha / 255;
+    let b = (color & 0xFF) * alpha / 255;
+    (alpha << 24) | (r << 16) | (g << 8) | b
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_bubble(
+    mem_dc: HDC,
+    bits: &mut [u32],
+    w: i32,
+    h: i32,
+    u: i32,
+    char_x_logical: f32,
+    text: &str,
+    ttl: u32,
+    max_ttl: u32,
+    used: &mut Vec<(i32, i32)>,
+) {
+    let bubble_h = 18 * u;
+    let bubble_w = 84 * u;
+    // Center above the character, clamped to the window.
+    let cx = (char_x_logical as i32 + SPRITE / 2) * u;
+    let mut bx = (cx - bubble_w / 2).clamp(0, (w - bubble_w).max(0));
+    let mut by = 1 * u;
+    // Avoid overlapping an existing bubble by shifting horizontally if needed.
+    for (ux0, ux1) in used.iter() {
+        if bx < *ux1 && bx + bubble_w > *ux0 {
+            bx = (*ux1 + 2 * u).min((w - bubble_w).max(0));
+        }
+    }
+    let _ = &mut by;
+    used.push((bx, bx + bubble_w));
+
+    let bg = bgra(252, 252, 250);
+    let border = bgra(120, 120, 128);
+    fill_block(bits, w, h, bx, by, bubble_w, bubble_h, border);
+    fill_block(bits, w, h, bx + u, by + u, bubble_w - 2 * u, bubble_h - 2 * u, bg);
+    // tail pointing down toward the character
+    let tail_x = (cx - u).clamp(bx + 2 * u, bx + bubble_w - 3 * u);
+    fill_block(bits, w, h, tail_x, by + bubble_h, 2 * u, 2 * u, bg);
 
     unsafe {
         let font_name = native_interop::wide_str("Segoe UI");
         let font = CreateFontW(
-            -(2 * u),
+            -(11 * u),
             0,
             0,
             0,
-            FW_MEDIUM.0 as i32,
+            FW_SEMIBOLD.0 as i32,
             0,
             0,
             0,
@@ -749,14 +1315,13 @@ fn draw_bubble(mem_dc: HDC, bits: &mut [u32], w: i32, _h: i32, u: i32, text: &st
         );
         let old_font = SelectObject(mem_dc, font);
         let _ = SetBkMode(mem_dc, TRANSPARENT);
-        let _ = SetTextColor(mem_dc, COLORREF(native_interop::colorref(30, 30, 30)));
-
+        let _ = SetTextColor(mem_dc, COLORREF(native_interop::colorref(30, 30, 36)));
         let mut text_wide: Vec<u16> = text.encode_utf16().collect();
         let mut rect = RECT {
-            left: bx + pad,
-            top: by + 1,
-            right: bx + bubble_w - pad,
-            bottom: by + bubble_h - 1,
+            left: bx + 2 * u,
+            top: by + u,
+            right: bx + bubble_w - 2 * u,
+            bottom: by + bubble_h - u,
         };
         let _ = DrawTextW(
             mem_dc,
@@ -764,56 +1329,127 @@ fn draw_bubble(mem_dc: HDC, bits: &mut [u32], w: i32, _h: i32, u: i32, text: &st
             &mut rect,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_WORD_ELLIPSIS,
         );
-
         SelectObject(mem_dc, old_font);
         let _ = DeleteObject(font);
     }
 
-    // Force the whole bubble region opaque so the GDI-drawn text is visible.
-    for yy in by..(by + bubble_h) {
-        if yy < 0 || yy >= _h {
+    // Determine fade alpha for the last few ticks.
+    let alpha: u32 = if ttl < FADE_TICKS && max_ttl > FADE_TICKS {
+        (64 + (ttl * 191 / FADE_TICKS)).min(255)
+    } else {
+        255
+    };
+
+    // Force the bubble region's alpha (GDI text leaves the alpha byte at 0).
+    // During fade we also premultiply so partial alpha composites correctly.
+    let y0 = by;
+    let y1 = (by + bubble_h + 2 * u).min(h);
+    let x0 = bx.max(0);
+    let x1 = (bx + bubble_w).min(w);
+    for yy in y0..y1 {
+        if yy < 0 {
             continue;
         }
-        for xx in bx..(bx + bubble_w) {
-            if xx < 0 || xx >= w {
-                continue;
-            }
+        for xx in x0..x1 {
             let idx = (yy * w + xx) as usize;
-            bits[idx] |= 0xFF00_0000;
+            let px = bits[idx];
+            if alpha >= 255 {
+                bits[idx] = px | 0xFF00_0000;
+            } else if px & 0x00FF_FFFF != 0 || (yy < by + bubble_h && xx < bx + bubble_w) {
+                bits[idx] = premul(px & 0x00FF_FFFF, alpha);
+            }
         }
     }
 }
 
 // ----- localized message pools ----------------------------------------------
+// Cat = aloof / sarcastic / occasionally cute. Dog = eager / energetic.
+// Japanese and English are provided; other languages fall back to English,
+// consistent with keeping all strings embedded in the binary.
 
-fn message_pool(lang: LanguageId, trigger: Trigger) -> &'static [&'static str] {
+fn message_pool(lang: LanguageId, is_cat: bool, pool: Pool) -> &'static [&'static str] {
     match lang {
-        LanguageId::Japanese => match trigger {
-            Trigger::IdleEncourage => &["いい調子！", "まだ余裕あるよ！", "その調子！"],
-            Trigger::SoftWarn => &["そろそろ気をつけてね", "8割こえたよ", "ペース配分しよ？"],
-            Trigger::UrgentWarn => &["もうすぐ上限！", "あと少しで限界だよ！", "9割こえた！注意！"],
-            Trigger::Rest => &["お疲れさま！", "今日もよくがんばったね！", "ひと休みしよう"],
-        },
-        // English (also the fallback for languages without a dedicated pool yet).
-        _ => match trigger {
-            Trigger::IdleEncourage => {
-                &["Looking good!", "Plenty left, keep going!", "Nice and steady."]
-            }
-            Trigger::SoftWarn => &[
-                "Getting a bit high...",
-                "Maybe ease up soon.",
-                "You're past 80%.",
+        LanguageId::Japanese => ja_pool(is_cat, pool),
+        _ => en_pool(is_cat, pool),
+    }
+}
+
+fn ja_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
+    if is_cat {
+        match pool {
+            Pool::Hover => &["なに？", "…べつに嬉しくないし", "みてるの？", "ひま？", "なでる気？"],
+            Pool::Click => &["やめてよね", "…ふん", "もう一回？しょうがないにゃ", "なに用？", "ま、いいけど"],
+            Pool::Idle => &["zzz…", "ひまだにゃ", "…", "のびーっ"],
+            Pool::Soft => &["そろそろ気をつけたら？", "8割こえたにゃ", "ちょっと多いんじゃない"],
+            Pool::Urgent => &["やばいにゃ！", "もう限界だってば！", "9割こえた、知らないよ"],
+            Pool::Rest => &["…おつかれ", "ま、がんばったんじゃない", "ひと休みしたら？"],
+            Pool::Encourage => &["いい調子じゃない", "まだ余裕でしょ", "ふん、悪くないね"],
+        }
+    } else {
+        match pool {
+            Pool::Hover => &["なになに！？", "あそぶ！？", "みて！みて！", "わくわく！", "こっちこっち！"],
+            Pool::Click => &["やったー！！", "もっとなでて〜！！", "わーい🐾", "うれしー！", "もう一回！もう一回！"],
+            Pool::Idle => &["たいくつだワン", "あそぼー！", "そわそわ…", "おさんぽ行きたい！"],
+            Pool::Soft => &["そろそろ気をつけて！", "8割こえたよ！", "ちょっと多いかも！"],
+            Pool::Urgent => &["たいへんだワン！", "もうすぐ限界だよー！", "9割！きをつけて！"],
+            Pool::Rest => &["きょうもがんばったね！", "おつかれさま！", "えらいぞ！"],
+            Pool::Encourage => &["いい調子だワン！", "その調子その調子！", "がんばってるね！"],
+        }
+    }
+}
+
+fn en_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
+    if is_cat {
+        match pool {
+            Pool::Hover => &[
+                "...what do you want.",
+                "oh, it's you.",
+                "are you staring?",
+                "yeah?",
+                "...fine, look.",
             ],
-            Trigger::UrgentWarn => &[
-                "Almost at the limit!",
-                "Careful - nearly maxed!",
-                "Over 90%! Slow down.",
+            Pool::Click => &[
+                "must you.",
+                "...hmph.",
+                "again? whatever.",
+                "do you mind?",
+                "fine, I guess.",
             ],
-            Trigger::Rest => &[
-                "Take a break, you earned it.",
-                "Nice work today!",
-                "Time to relax.",
+            Pool::Idle => &["zzz...", "so bored.", "...", "*stretch*"],
+            Pool::Soft => &[
+                "maybe ease up?",
+                "past 80%, you know.",
+                "that's a lot...",
             ],
-        },
+            Pool::Urgent => &[
+                "this is bad.",
+                "you're nearly maxed.",
+                "over 90%. not my problem.",
+            ],
+            Pool::Rest => &["...good job.", "not bad, I suppose.", "go rest already."],
+            Pool::Encourage => &["doing fine.", "plenty left.", "hmph, not bad."],
+        }
+    } else {
+        match pool {
+            Pool::Hover => &[
+                "HI HI HI!! 🐾",
+                "play?? play??",
+                "look at me!!",
+                "oh boy oh boy!",
+                "over here!!",
+            ],
+            Pool::Click => &[
+                "YESYESYES!!",
+                "again again!! 🐾",
+                "best day ever!!",
+                "pet me more!!",
+                "wheee!!",
+            ],
+            Pool::Idle => &["so bored woof", "let's play!", "*wags tail*", "walkies??"],
+            Pool::Soft => &["careful now!", "past 80%!", "that's kinda lots!"],
+            Pool::Urgent => &["uh oh!!", "almost maxed!!", "over 90%! careful!!"],
+            Pool::Rest => &["great job today!!", "you did it!!", "so proud!!"],
+            Pool::Encourage => &["doing great!!", "keep going!!", "you got this!!"],
+        }
     }
 }

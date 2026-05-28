@@ -304,7 +304,7 @@ struct SettingsFile {
     show_codex: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bar_theme: Option<String>,
-    #[serde(default)]
+    #[serde(default = "default_characters_enabled")]
     characters_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     character_kind: Option<String>,
@@ -321,7 +321,7 @@ impl Default for SettingsFile {
             show_claude_code: true,
             show_codex: false,
             bar_theme: None,
-            characters_enabled: false,
+            characters_enabled: true,
             character_kind: None,
         }
     }
@@ -341,6 +341,10 @@ fn default_show_claude_code() -> bool {
 
 fn default_show_codex() -> bool {
     false
+}
+
+fn default_characters_enabled() -> bool {
+    true
 }
 
 fn load_settings() -> SettingsFile {
