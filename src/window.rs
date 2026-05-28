@@ -258,9 +258,16 @@ fn show_reset_timer() -> bool {
     SHOW_RESET_TIMER.load(Ordering::Relaxed)
 }
 
-/// Whether the text column (percentage and/or countdown) is shown at all.
-fn text_area_shown() -> bool {
-    show_percentages() || show_reset_timer()
+/// Logical width of the text column, sized to what's actually shown so a single
+/// element (e.g. just "62%") doesn't leave a wide blank gap before the right
+/// edge. Returns 0 when nothing is shown.
+fn text_column_width_logical() -> i32 {
+    match (show_percentages(), show_reset_timer()) {
+        (true, true) => TEXT_WIDTH, // "62% · 1h20m"
+        (true, false) => 36,        // "100%"
+        (false, true) => 50,        // countdown incl. CJK suffix e.g. "4時間"
+        (false, false) => 0,
+    }
 }
 
 /// Scale a base pixel value (designed at 96 DPI) to the current DPI.
@@ -3219,8 +3226,9 @@ fn draw_row(
 
 fn model_usage_width(segment_count: i32) -> i32 {
     let bar_w = (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP);
-    if text_area_shown() {
-        bar_w + sc(BAR_RIGHT_MARGIN) + sc(TEXT_WIDTH)
+    let text_w = text_column_width_logical();
+    if text_w > 0 {
+        bar_w + sc(BAR_RIGHT_MARGIN) + sc(text_w)
     } else {
         bar_w
     }
@@ -3284,7 +3292,7 @@ fn draw_usage_bar(
             let mut text_rect = RECT {
                 left: text_x,
                 top: y,
-                right: text_x + sc(TEXT_WIDTH),
+                right: text_x + sc(text_column_width_logical()),
                 bottom: y + seg_h,
             };
             let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
