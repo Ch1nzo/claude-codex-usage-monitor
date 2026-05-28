@@ -144,6 +144,10 @@ const IDM_SEG_10: u16 = 93;
 const IDM_TOGGLE_LABELS: u16 = 94;
 const IDM_TOGGLE_PERCENT: u16 = 95;
 const IDM_TOGGLE_TIMER: u16 = 96;
+const IDM_TOGGLE_DETAILED: u16 = 97;
+const IDM_PACE_OFF: u16 = 98;
+const IDM_PACE_TICK: u16 = 99;
+const IDM_PACE_SOLID: u16 = 100;
 
 const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
 
@@ -240,6 +244,9 @@ static CURRENT_SEGMENT_COUNT: AtomicU8 = AtomicU8::new(10);
 static SHOW_LABELS: AtomicBool = AtomicBool::new(true);
 static SHOW_PERCENTAGES: AtomicBool = AtomicBool::new(true);
 static SHOW_RESET_TIMER: AtomicBool = AtomicBool::new(true);
+static SHOW_DETAILED_REMAINING: AtomicBool = AtomicBool::new(false);
+/// Pace indicator style: 0 = Off, 1 = Tick, 2 = Solid.
+static PACE_STYLE: AtomicU8 = AtomicU8::new(0);
 
 fn current_segment_count() -> i32 {
     match CURRENT_SEGMENT_COUNT.load(Ordering::Relaxed) {
@@ -262,14 +269,92 @@ fn show_reset_timer() -> bool {
     SHOW_RESET_TIMER.load(Ordering::Relaxed)
 }
 
+fn show_detailed_remaining() -> bool {
+    SHOW_DETAILED_REMAINING.load(Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaceStyle {
+    Off,
+    Tick,
+    Solid,
+}
+
+impl PaceStyle {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => PaceStyle::Tick,
+            2 => PaceStyle::Solid,
+            _ => PaceStyle::Off,
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            PaceStyle::Off => 0,
+            PaceStyle::Tick => 1,
+            PaceStyle::Solid => 2,
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            PaceStyle::Off => "Off",
+            PaceStyle::Tick => "Tick",
+            PaceStyle::Solid => "Solid",
+        }
+    }
+
+    fn from_code(code: &str) -> Self {
+        match code {
+            "Tick" => PaceStyle::Tick,
+            "Solid" => PaceStyle::Solid,
+            _ => PaceStyle::Off,
+        }
+    }
+}
+
+fn pace_style() -> PaceStyle {
+    PaceStyle::from_u8(PACE_STYLE.load(Ordering::Relaxed))
+}
+
+const PACE_SESSION_WINDOW_SECS: f64 = 5.0 * 3600.0;
+const PACE_WEEKLY_WINDOW_SECS: f64 = 7.0 * 86400.0;
+
+/// Where usage *should* be (0.0..1.0) if spread evenly across the window, i.e.
+/// elapsed_time / window_length. None when pace is off or no reset time.
+fn pace_expected(resets_at: Option<SystemTime>, window_secs: f64) -> Option<f64> {
+    if pace_style() == PaceStyle::Off {
+        return None;
+    }
+    let reset = resets_at?;
+    let remaining = reset.duration_since(SystemTime::now()).ok()?.as_secs() as f64;
+    let elapsed = window_secs - remaining;
+    Some((elapsed / window_secs).clamp(0.0, 1.0))
+}
+
 /// Logical width of the text column, sized to what's actually shown so a single
 /// element (e.g. just "62%") doesn't leave a wide blank gap before the right
-/// edge. Returns 0 when nothing is shown.
+/// edge. Wider when the detailed remaining time is on. Returns 0 when nothing
+/// is shown.
 fn text_column_width_logical() -> i32 {
+    let detailed = show_detailed_remaining();
     match (show_percentages(), show_reset_timer()) {
-        (true, true) => TEXT_WIDTH, // "62% · 1h20m"
-        (true, false) => 36,        // "100%"
-        (false, true) => 50,        // countdown incl. CJK suffix e.g. "4時間"
+        (true, true) => {
+            if detailed {
+                100 // "100% · 23h 59m" (incl. CJK suffixes)
+            } else {
+                TEXT_WIDTH
+            }
+        }
+        (true, false) => 36, // "100%"
+        (false, true) => {
+            if detailed {
+                72 // "23h 59m" / "23時間59分"
+            } else {
+                50
+            }
+        }
         (false, false) => 0,
     }
 }
@@ -372,6 +457,10 @@ struct SettingsFile {
     show_percentages: bool,
     #[serde(default = "default_true")]
     show_reset_timer: bool,
+    #[serde(default)]
+    show_detailed_remaining: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pace_indicator_style: Option<String>,
 }
 
 impl Default for SettingsFile {
@@ -393,6 +482,8 @@ impl Default for SettingsFile {
             show_labels: true,
             show_percentages: true,
             show_reset_timer: true,
+            show_detailed_remaining: false,
+            pace_indicator_style: None,
         }
     }
 }
@@ -469,6 +560,8 @@ fn save_state_settings() {
             show_labels: show_labels(),
             show_percentages: show_percentages(),
             show_reset_timer: show_reset_timer(),
+            show_detailed_remaining: show_detailed_remaining(),
+            pace_indicator_style: Some(pace_style().code().to_string()),
         });
     }
 }
@@ -604,21 +697,22 @@ fn refresh_usage_texts(state: &mut AppState) {
     let strings = state.language.strings();
     let sp = show_percentages();
     let st = show_reset_timer();
+    let dt = show_detailed_remaining();
     let Some(data) = state.data.as_ref() else {
         return;
     };
 
     if let Some(claude_code) = data.claude_code.as_ref() {
-        state.session_text = poller::format_line(&claude_code.session, strings, sp, st);
-        state.weekly_text = poller::format_line(&claude_code.weekly, strings, sp, st);
+        state.session_text = poller::format_line(&claude_code.session, strings, sp, st, dt);
+        state.weekly_text = poller::format_line(&claude_code.weekly, strings, sp, st, dt);
     } else if state.show_claude_code {
         state.session_text = "!".to_string();
         state.weekly_text = "!".to_string();
     }
 
     if let Some(codex) = data.codex.as_ref() {
-        state.codex_session_text = poller::format_line(&codex.session, strings, sp, st);
-        state.codex_weekly_text = poller::format_line(&codex.weekly, strings, sp, st);
+        state.codex_session_text = poller::format_line(&codex.session, strings, sp, st, dt);
+        state.codex_weekly_text = poller::format_line(&codex.weekly, strings, sp, st, dt);
     } else if state.show_codex {
         state.codex_session_text = "!".to_string();
         state.codex_weekly_text = "!".to_string();
@@ -1188,6 +1282,13 @@ pub fn run() {
         SHOW_LABELS.store(settings.show_labels, Ordering::Relaxed);
         SHOW_PERCENTAGES.store(settings.show_percentages, Ordering::Relaxed);
         SHOW_RESET_TIMER.store(settings.show_reset_timer, Ordering::Relaxed);
+        SHOW_DETAILED_REMAINING.store(settings.show_detailed_remaining, Ordering::Relaxed);
+        let initial_pace = settings
+            .pace_indicator_style
+            .as_deref()
+            .map(PaceStyle::from_code)
+            .unwrap_or(PaceStyle::Off);
+        PACE_STYLE.store(initial_pace.to_u8(), Ordering::Relaxed);
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
@@ -1412,25 +1513,37 @@ fn render_layered() {
         codex_weekly_text,
         show_claude_code,
         show_codex,
+        cc_session_pace,
+        cc_weekly_pace,
+        cx_session_pace,
+        cx_weekly_pace,
     ) = {
         let state = lock_state();
         match state.as_ref() {
-            Some(s) => (
-                s.hwnd,
-                s.is_dark,
-                s.embedded,
-                s.language.strings(),
-                s.session_percent,
-                s.session_text.clone(),
-                s.weekly_percent,
-                s.weekly_text.clone(),
-                s.codex_session_percent,
-                s.codex_session_text.clone(),
-                s.codex_weekly_percent,
-                s.codex_weekly_text.clone(),
-                s.show_claude_code,
-                s.show_codex,
-            ),
+            Some(s) => {
+                let cc = s.data.as_ref().and_then(|d| d.claude_code.as_ref());
+                let cx = s.data.as_ref().and_then(|d| d.codex.as_ref());
+                (
+                    s.hwnd,
+                    s.is_dark,
+                    s.embedded,
+                    s.language.strings(),
+                    s.session_percent,
+                    s.session_text.clone(),
+                    s.weekly_percent,
+                    s.weekly_text.clone(),
+                    s.codex_session_percent,
+                    s.codex_session_text.clone(),
+                    s.codex_weekly_percent,
+                    s.codex_weekly_text.clone(),
+                    s.show_claude_code,
+                    s.show_codex,
+                    pace_expected(cc.and_then(|u| u.session.resets_at), PACE_SESSION_WINDOW_SECS),
+                    pace_expected(cc.and_then(|u| u.weekly.resets_at), PACE_WEEKLY_WINDOW_SECS),
+                    pace_expected(cx.and_then(|u| u.session.resets_at), PACE_SESSION_WINDOW_SECS),
+                    pace_expected(cx.and_then(|u| u.weekly.resets_at), PACE_WEEKLY_WINDOW_SECS),
+                )
+            }
             None => return,
         }
     };
@@ -1520,6 +1633,10 @@ fn render_layered() {
             show_claude_code,
             show_codex,
             &codex_accent,
+            cc_session_pace,
+            cc_weekly_pace,
+            cx_session_pace,
+            cx_weekly_pace,
         );
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
@@ -1590,6 +1707,10 @@ fn paint_content(
     show_claude_code: bool,
     show_codex: bool,
     codex_accent: &Color,
+    cc_session_pace: Option<f64>,
+    cc_weekly_pace: Option<f64>,
+    cx_session_pace: Option<f64>,
+    cx_weekly_pace: Option<f64>,
 ) {
     unsafe {
         let client_rect = RECT {
@@ -1682,6 +1803,8 @@ fn paint_content(
             accent,
             codex_accent,
             track,
+            cc_session_pace,
+            cx_session_pace,
         );
         draw_row(
             hdc,
@@ -1699,6 +1822,8 @@ fn paint_content(
             accent,
             codex_accent,
             track,
+            cc_weekly_pace,
+            cx_weekly_pace,
         );
 
         SelectObject(hdc, old_font);
@@ -1889,19 +2014,20 @@ fn schedule_countdown_timer() {
         }
     }
 
+    let dt = show_detailed_remaining();
     let delays = [
         data.claude_code
             .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
+            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at, dt)),
         data.claude_code
             .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
+            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at, dt)),
         data.codex
             .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
+            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at, dt)),
         data.codex
             .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
+            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at, dt)),
     ];
     let min_delay = delays.into_iter().flatten().min();
 
@@ -2662,6 +2788,29 @@ unsafe extern "system" fn wnd_proc(
                     position_at_taskbar();
                     render_layered();
                 }
+                IDM_TOGGLE_DETAILED => {
+                    SHOW_DETAILED_REMAINING.fetch_xor(true, Ordering::Relaxed);
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            refresh_usage_texts(s);
+                        }
+                    }
+                    save_state_settings();
+                    position_at_taskbar();
+                    render_layered();
+                    schedule_countdown_timer();
+                }
+                IDM_PACE_OFF | IDM_PACE_TICK | IDM_PACE_SOLID => {
+                    let style = match id {
+                        IDM_PACE_TICK => PaceStyle::Tick,
+                        IDM_PACE_SOLID => PaceStyle::Solid,
+                        _ => PaceStyle::Off,
+                    };
+                    PACE_STYLE.store(style.to_u8(), Ordering::Relaxed);
+                    save_state_settings();
+                    render_layered();
+                }
                 id if id == tray_icon::IDM_TOGGLE_WIDGET => {
                     toggle_widget_visibility(hwnd);
                 }
@@ -2864,6 +3013,55 @@ fn show_context_menu(hwnd: HWND) {
                 PCWSTR::from_raw(label_str.as_ptr()),
             );
         }
+
+        // Detailed remaining time toggle
+        let detailed_str = native_interop::wide_str(strings.show_detailed_remaining);
+        let detailed_flags = if show_detailed_remaining() {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            appearance_menu,
+            detailed_flags,
+            IDM_TOGGLE_DETAILED as usize,
+            PCWSTR::from_raw(detailed_str.as_ptr()),
+        );
+
+        // Pace indicator (radio: Off / Tick / Solid)
+        let cur_pace = pace_style();
+        let pace_menu = CreatePopupMenu().unwrap();
+        for (id, style, label) in [
+            (IDM_PACE_OFF, PaceStyle::Off, strings.pace_off),
+            (IDM_PACE_TICK, PaceStyle::Tick, strings.pace_tick),
+            (IDM_PACE_SOLID, PaceStyle::Solid, strings.pace_solid),
+        ] {
+            let label_str = native_interop::wide_str(label);
+            let flags = if style == cur_pace {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                pace_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label_str.as_ptr()),
+            );
+        }
+        let pace_label = native_interop::wide_str(strings.show_pace_indicator);
+        // Parent shows a checkmark when a style is active.
+        let pace_parent_flags = if cur_pace == PaceStyle::Off {
+            MF_POPUP
+        } else {
+            MF_POPUP | MF_CHECKED
+        };
+        let _ = AppendMenuW(
+            appearance_menu,
+            pace_parent_flags,
+            pace_menu.0 as usize,
+            PCWSTR::from_raw(pace_label.as_ptr()),
+        );
 
         let _ = AppendMenuW(appearance_menu, MF_SEPARATOR, 0, PCWSTR::null());
 
@@ -3130,23 +3328,35 @@ fn paint(hdc: HDC, hwnd: HWND) {
         codex_weekly_text,
         show_claude_code,
         show_codex,
+        cc_session_pace,
+        cc_weekly_pace,
+        cx_session_pace,
+        cx_weekly_pace,
     ) = {
         let state = lock_state();
         match state.as_ref() {
-            Some(s) => (
-                s.is_dark,
-                s.language.strings(),
-                s.session_percent,
-                s.session_text.clone(),
-                s.weekly_percent,
-                s.weekly_text.clone(),
-                s.codex_session_percent,
-                s.codex_session_text.clone(),
-                s.codex_weekly_percent,
-                s.codex_weekly_text.clone(),
-                s.show_claude_code,
-                s.show_codex,
-            ),
+            Some(s) => {
+                let cc = s.data.as_ref().and_then(|d| d.claude_code.as_ref());
+                let cx = s.data.as_ref().and_then(|d| d.codex.as_ref());
+                (
+                    s.is_dark,
+                    s.language.strings(),
+                    s.session_percent,
+                    s.session_text.clone(),
+                    s.weekly_percent,
+                    s.weekly_text.clone(),
+                    s.codex_session_percent,
+                    s.codex_session_text.clone(),
+                    s.codex_weekly_percent,
+                    s.codex_weekly_text.clone(),
+                    s.show_claude_code,
+                    s.show_codex,
+                    pace_expected(cc.and_then(|u| u.session.resets_at), PACE_SESSION_WINDOW_SECS),
+                    pace_expected(cc.and_then(|u| u.weekly.resets_at), PACE_WEEKLY_WINDOW_SECS),
+                    pace_expected(cx.and_then(|u| u.session.resets_at), PACE_SESSION_WINDOW_SECS),
+                    pace_expected(cx.and_then(|u| u.weekly.resets_at), PACE_WEEKLY_WINDOW_SECS),
+                )
+            }
             None => return,
         }
     };
@@ -3204,6 +3414,10 @@ fn paint(hdc: HDC, hwnd: HWND) {
             show_claude_code,
             show_codex,
             &codex_accent,
+            cc_session_pace,
+            cc_weekly_pace,
+            cx_session_pace,
+            cx_weekly_pace,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -3230,6 +3444,8 @@ fn draw_row(
     claude_accent: &Color,
     codex_accent: &Color,
     track: &Color,
+    claude_pace: Option<f64>,
+    codex_pace: Option<f64>,
 ) {
     let seg_h = sc(SEGMENT_H);
     let active_models = active_model_count(show_claude_code, show_codex);
@@ -3277,6 +3493,7 @@ fn draw_row(
                 track,
                 &claude_value_color,
                 is_dark,
+                claude_pace,
             );
             model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
         }
@@ -3292,6 +3509,7 @@ fn draw_row(
                 track,
                 &codex_value_color,
                 is_dark,
+                codex_pace,
             );
         }
     }
@@ -3319,6 +3537,7 @@ fn draw_usage_bar(
     track: &Color,
     text_color: &Color,
     is_dark: bool,
+    expected: Option<f64>,
 ) {
     let seg_w = sc(SEGMENT_W);
     let seg_h = sc(SEGMENT_H);
@@ -3358,6 +3577,11 @@ fn draw_usage_bar(
         BarTheme::Pixel => draw_bar_pixel(hdc, bar_x, y, bar_w, seg_h, percent, &fill, track),
     }
 
+    // Pace indicator, drawn inside the bar bounds (does not change width).
+    if let Some(exp) = expected {
+        draw_pace_marker(hdc, bar_x, y, bar_w, seg_h, percent, exp, is_dark);
+    }
+
     if !text.is_empty() {
         unsafe {
             let text_x = bar_x + bar_w + sc(BAR_RIGHT_MARGIN);
@@ -3375,6 +3599,78 @@ fn draw_usage_bar(
                 &mut text_rect,
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE,
             );
+        }
+    }
+}
+
+/// Draw the pace indicator. Green when actual usage is behind the
+/// expected-pace position (headroom), red when ahead (at risk). `Tick` is a
+/// thin vertical line at the expected position; `Solid` fills the gap between
+/// actual usage and the expected position.
+#[allow(clippy::too_many_arguments)]
+fn draw_pace_marker(
+    hdc: HDC,
+    bar_x: i32,
+    y: i32,
+    bar_w: i32,
+    bar_h: i32,
+    percent: f64,
+    expected: f64,
+    is_dark: bool,
+) {
+    let style = pace_style();
+    if style == PaceStyle::Off {
+        return;
+    }
+    let actual = (percent / 100.0).clamp(0.0, 1.0);
+    let exp = expected.clamp(0.0, 1.0);
+    let behind = actual <= exp; // behind pace = headroom = green
+    let color = if behind {
+        if is_dark {
+            Color::from_hex("#3FB950")
+        } else {
+            Color::from_hex("#2EA043")
+        }
+    } else if is_dark {
+        Color::from_hex("#F85149")
+    } else {
+        Color::from_hex("#DA3633")
+    };
+
+    let exp_x = bar_x + (exp * bar_w as f64).round() as i32;
+    unsafe {
+        match style {
+            PaceStyle::Tick => {
+                let w = sc(2).max(1);
+                let rect = RECT {
+                    left: exp_x - w / 2,
+                    top: y,
+                    right: exp_x - w / 2 + w,
+                    bottom: y + bar_h,
+                };
+                let brush = CreateSolidBrush(COLORREF(color.to_colorref()));
+                FillRect(hdc, &rect, brush);
+                let _ = DeleteObject(brush);
+            }
+            PaceStyle::Solid => {
+                let actual_x = bar_x + (actual * bar_w as f64).round() as i32;
+                let lo = exp_x.min(actual_x);
+                let hi = exp_x.max(actual_x);
+                if hi > lo {
+                    let band_h = (bar_h / 3).max(sc(2));
+                    let top = y + (bar_h - band_h) / 2;
+                    let rect = RECT {
+                        left: lo,
+                        top,
+                        right: hi,
+                        bottom: top + band_h,
+                    };
+                    let brush = CreateSolidBrush(COLORREF(color.to_colorref()));
+                    FillRect(hdc, &rect, brush);
+                    let _ = DeleteObject(brush);
+                }
+            }
+            PaceStyle::Off => {}
         }
     }
 }

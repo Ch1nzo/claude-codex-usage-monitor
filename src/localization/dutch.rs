@@ -64,4 +64,9 @@ pub(super) const STRINGS: Strings = Strings {
     color_grey: "Grijs",
     color_brown: "Bruin",
     color_black: "Zwart",
+    show_detailed_remaining: "Gedetailleerde resterende tijd tonen",
+    show_pace_indicator: "Tempo-indicator",
+    pace_off: "Uit",
+    pace_tick: "Streep",
+    pace_solid: "Balk",
 };
