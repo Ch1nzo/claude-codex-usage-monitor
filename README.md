@@ -1,3 +1,5 @@
+**English** · [日本語](README.ja.md)
+
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -33,8 +35,22 @@ It works best if you want a simple "how close am I to the limit?" display that i
 ## Requirements
 
 - Windows 10 or Windows 11
-- Claude Code (CLI or App) installed and authenticated
-- Optional: Codex CLI installed and authenticated, if you want Codex usage
+- **Claude Code (CLI or App) installed and signed in**
+- Optional: Codex CLI installed and signed in, if you want Codex usage
+
+> ### ⚠️ Claude Code or Codex must be installed first
+>
+> This widget **does not display any usage until Claude Code (or Codex) is installed and signed in.**
+> It does not log you in or fetch usage on its own — it reads the credentials that Claude Code /
+> Codex create when you sign in. If neither is set up, the bars show `!` and a notification will
+> prompt you to sign in.
+>
+> Install the official tools first, then sign in:
+>
+> - **Claude Code** — https://github.com/anthropics/claude-code  (after install, run `claude` and use `/login`)
+> - **Codex CLI** — https://github.com/openai/codex  (after install, complete the CLI sign-in)
+>
+> Start this app **after** you have signed in. It will then pick up your usage automatically.
 
 If you use Claude Code through WSL, that is supported too. The monitor can read your Claude Code credentials from Windows or from your WSL environment.
 
@@ -88,6 +104,7 @@ Use the right-click **Characters** menu to show a small pixel companion that roa
 
 - Toggle the characters on or off
 - Choose **Cat**, **Dog**, or **Both**
+- Pick a color (Cat: Orange/Grey, Dog: Brown/Black)
 
 The characters idle, walk, and blink, and react to your usage: they show an encouraging note when you have room, a soft warning past 80%, an urgent warning past 90%, and a "nice work" message when usage resets. **Hover** over a character for a reaction after a moment, or **click** it for a quick response — the cat is aloof, the dog is eager. Messages are available in Japanese and English (other languages fall back to English). Characters are shown by default.
 
