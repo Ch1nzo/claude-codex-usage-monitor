@@ -14,7 +14,7 @@ Unicode true
 !define APP_NAME "Claude & Codex Usage Monitor"
 !define APP_ID "ClaudeCodexUsageMonitor"
 !define PUBLISHER "PIARY Co.Ltd"
-!define VERSION "1.0.0"
+!define VERSION "1.1.0"
 !define EXE_NAME "claude-codex-usage-monitor.exe"
 ; EXE_SOURCE can be overridden on the command line, e.g. in CI which uses the
 ; MSVC target dir:  makensis /DEXE_SOURCE=..\target\release\<exe> script.nsi
