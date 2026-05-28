@@ -12,11 +12,14 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::character::{self, CharacterKind};
+use crate::detail;
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
@@ -148,6 +151,7 @@ const IDM_TOGGLE_TIMER: u16 = 96;
 const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
+const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 
@@ -623,6 +627,60 @@ fn refresh_usage_texts(state: &mut AppState) {
         state.codex_session_text = "!".to_string();
         state.codex_weekly_text = "!".to_string();
     }
+}
+
+/// Build the hover detail-panel content from current usage state.
+fn build_detail_data() -> Option<detail::DetailData> {
+    let state = lock_state();
+    let s = state.as_ref()?;
+    let strings = s.language.strings();
+    let mut rows: Vec<detail::DetailRow> = Vec::new();
+
+    if s.show_claude_code {
+        let (sr, wr) = s
+            .data
+            .as_ref()
+            .and_then(|d| d.claude_code.as_ref())
+            .map(|u| {
+                (
+                    poller::format_countdown(u.session.resets_at, strings),
+                    poller::format_countdown(u.weekly.resets_at, strings),
+                )
+            })
+            .unwrap_or_default();
+        rows.push(detail::DetailRow {
+            name: strings.claude_code_model.to_string(),
+            session_pct: s.session_percent,
+            session_reset: sr,
+            weekly_pct: s.weekly_percent,
+            weekly_reset: wr,
+        });
+    }
+    if s.show_codex {
+        let (sr, wr) = s
+            .data
+            .as_ref()
+            .and_then(|d| d.codex.as_ref())
+            .map(|u| {
+                (
+                    poller::format_countdown(u.session.resets_at, strings),
+                    poller::format_countdown(u.weekly.resets_at, strings),
+                )
+            })
+            .unwrap_or_default();
+        rows.push(detail::DetailRow {
+            name: strings.codex_model.to_string(),
+            session_pct: s.codex_session_percent,
+            session_reset: sr,
+            weekly_pct: s.codex_weekly_percent,
+            weekly_reset: wr,
+        });
+    }
+
+    Some(detail::DetailData {
+        rows,
+        is_dark: s.is_dark,
+    })
 }
 
 fn set_window_title(hwnd: HWND, strings: Strings) {
@@ -1350,6 +1408,7 @@ pub fn run() {
                 language,
             );
         }
+        detail::init();
 
         // Poll timer: 15 minutes
         let initial_poll_ms = {
@@ -2190,6 +2249,11 @@ unsafe extern "system" fn wnd_proc(
                 TIMER_COUNTDOWN => {
                     update_display();
                     render_layered();
+                    if detail::is_visible() {
+                        if let Some(data) = build_detail_data() {
+                            detail::update(data);
+                        }
+                    }
                     schedule_countdown_timer();
                 }
                 TIMER_RESET_POLL => {
@@ -2257,6 +2321,11 @@ unsafe extern "system" fn wnd_proc(
                     }
                 };
                 character::on_usage_update(max_pct, sess_pct, sess_reset, lang);
+            }
+            if detail::is_visible() {
+                if let Some(data) = build_detail_data() {
+                    detail::update(data);
+                }
             }
             schedule_countdown_timer();
             suppress_tray_reposition_for(Duration::from_millis(
@@ -2402,7 +2471,28 @@ unsafe extern "system" fn wnd_proc(
                         native_interop::move_window(hwnd_val, x, y, widget_width, widget_height);
                     }
                 }
+            } else {
+                // Hovering (not dragging): show the detail panel and arrange for
+                // a WM_MOUSELEAVE so we can hide it again.
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut tme);
+                if !detail::is_visible() {
+                    if let (Some(anchor), Some(data)) =
+                        (native_interop::get_window_rect_safe(hwnd), build_detail_data())
+                    {
+                        detail::show(anchor, data);
+                    }
+                }
             }
+            LRESULT(0)
+        }
+        _ if msg == WM_MOUSELEAVE_MSG => {
+            detail::hide();
             LRESULT(0)
         }
         WM_LBUTTONUP => {
@@ -2690,6 +2780,7 @@ unsafe extern "system" fn wnd_proc(
                 native_interop::unhook_win_event(h);
             }
             character::destroy();
+            detail::destroy();
             tray_icon::remove_all(hwnd);
             PostQuitMessage(0);
             LRESULT(0)
