@@ -1046,7 +1046,7 @@ pub fn format_line(
     }
 }
 
-pub fn format_countdown(resets_at: Option<SystemTime>, strings: Strings) -> String {
+fn format_countdown(resets_at: Option<SystemTime>, strings: Strings) -> String {
     let reset = match resets_at {
         Some(t) => t,
         None => return String::new(),
