@@ -3579,7 +3579,7 @@ fn draw_usage_bar(
 
     // Pace indicator, drawn inside the bar bounds (does not change width).
     if let Some(exp) = expected {
-        draw_pace_marker(hdc, bar_x, y, bar_w, seg_h, percent, exp);
+        draw_pace_marker(hdc, bar_x, y, bar_w, seg_h, segment_count, percent, exp, is_dark);
     }
 
     if !text.is_empty() {
@@ -3621,79 +3621,98 @@ fn fill_solid_rect(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, color
     }
 }
 
-/// Draw the pace indicator. Green when actual usage is behind the
-/// expected-pace position (headroom), red when ahead (at risk).
+/// Draw the pace indicator, aligned to the segment grid. Green when actual
+/// usage is behind the expected-pace position (headroom), red when ahead.
 ///
-/// Uses fixed high-contrast colors with a dark outline so the marker stays
-/// distinct from every bar theme's fill color, and is clipped strictly within
-/// the bar's drawable area. `Tick` is an outlined vertical line at the
-/// expected position; `Solid` marks the gap between actual usage and the
-/// expected position with a reduced-height band plus full-height edge lines.
-fn draw_pace_marker(hdc: HDC, bar_x: i32, y: i32, bar_w: i32, bar_h: i32, percent: f64, expected: f64) {
+/// Colors are derived from the bar's usage-threshold palette (the same green/
+/// red used by the threshold-coloured bar themes) and brightened so the pace
+/// region reads as a highlighted overlay rather than blending into the fill.
+///
+/// `Solid` recolours the whole segment blocks that fall in the gap between
+/// actual usage and the expected pace (boundary segments filled
+/// proportionally). `Tick` snaps a vertical, outlined line to the nearest
+/// segment boundary at the expected pace.
+#[allow(clippy::too_many_arguments)]
+fn draw_pace_marker(
+    hdc: HDC,
+    bar_x: i32,
+    y: i32,
+    bar_w: i32,
+    bar_h: i32,
+    segment_count: i32,
+    percent: f64,
+    expected: f64,
+    is_dark: bool,
+) {
     let style = pace_style();
-    if style == PaceStyle::Off {
+    if style == PaceStyle::Off || segment_count <= 0 {
         return;
     }
     let actual = (percent / 100.0).clamp(0.0, 1.0);
     let exp = expected.clamp(0.0, 1.0);
     let behind = actual <= exp; // behind pace = headroom = green
-    // High-contrast colors (Option C) chosen to stand out against any theme.
-    let color = if behind {
-        Color::from_hex("#00FF88") // bright mint
+    // Reuse the theme's low/high threshold colors, brightened so the pace
+    // region stands out from the normal fill even at the same hue.
+    let base = if behind {
+        usage_threshold_color(0.0, is_dark)
     } else {
-        Color::from_hex("#FF4444") // bright red
+        usage_threshold_color(100.0, is_dark)
     };
+    let color = lighten_color(&base, 0.30);
     let outline = Color::from_hex("#0A0A0A");
 
     let bar_right = bar_x + bar_w;
     let clampx = |v: i32| v.clamp(bar_x, bar_right);
-    let exp_x = clampx(bar_x + (exp * bar_w as f64).round() as i32);
 
     match style {
         PaceStyle::Tick => {
+            // Snap to the nearest segment boundary.
+            let seg = (exp * segment_count as f64).round();
+            let tick_ratio = seg / segment_count as f64;
+            let tick_x = clampx(bar_x + (tick_ratio * bar_w as f64).round() as i32);
             let core = sc(2).max(2);
             let half = core / 2;
-            // 1px dark outline, then the colored core on top.
             fill_solid_rect(
                 hdc,
-                clampx(exp_x - half - 1),
+                clampx(tick_x - half - 1),
                 y,
-                clampx(exp_x - half - 1 + core + 2),
+                clampx(tick_x - half - 1 + core + 2),
                 y + bar_h,
                 &outline,
             );
             fill_solid_rect(
                 hdc,
-                clampx(exp_x - half),
+                clampx(tick_x - half),
                 y,
-                clampx(exp_x - half + core),
+                clampx(tick_x - half + core),
                 y + bar_h,
                 &color,
             );
         }
         PaceStyle::Solid => {
-            let actual_x = clampx(bar_x + (actual * bar_w as f64).round() as i32);
-            let lo = exp_x.min(actual_x);
-            let hi = exp_x.max(actual_x);
-            if hi > lo {
-                // Reduced-height band so the underlying segment grid stays
-                // visible above/below; dark outline keeps it readable.
-                let band_h = (bar_h / 2).max(sc(2));
-                let top = y + (bar_h - band_h) / 2;
-                let bot = top + band_h;
-                fill_solid_rect(
-                    hdc,
-                    clampx(lo - 1),
-                    top - 1,
-                    clampx(hi + 1),
-                    bot + 1,
-                    &outline,
-                );
-                fill_solid_rect(hdc, lo, top, hi, bot, &color);
-                // Full-height edge lines mark the gap boundaries clearly.
-                let ew = sc(1).max(1);
-                fill_solid_rect(hdc, lo, y, clampx(lo + ew), y + bar_h, &color);
-                fill_solid_rect(hdc, clampx(hi - ew), y, hi, y + bar_h, &color);
+            let seg_w = sc(SEGMENT_W);
+            let seg_gap = sc(SEGMENT_GAP);
+            let lo_r = actual.min(exp);
+            let hi_r = actual.max(exp);
+            if hi_r <= lo_r {
+                return;
+            }
+            let seg_ratio = 1.0 / segment_count as f64;
+            for i in 0..segment_count {
+                let seg_start = i as f64 * seg_ratio;
+                let seg_end = seg_start + seg_ratio;
+                let ov_start = seg_start.max(lo_r);
+                let ov_end = seg_end.min(hi_r);
+                if ov_end <= ov_start {
+                    continue;
+                }
+                // Recolour the (possibly partial) gap portion of this segment.
+                let seg_x = bar_x + i * (seg_w + seg_gap);
+                let f0 = ((ov_start - seg_start) / seg_ratio).clamp(0.0, 1.0);
+                let f1 = ((ov_end - seg_start) / seg_ratio).clamp(0.0, 1.0);
+                let px0 = seg_x + (f0 * seg_w as f64).round() as i32;
+                let px1 = seg_x + (f1 * seg_w as f64).round() as i32;
+                fill_solid_rect(hdc, clampx(px0), y, clampx(px1), y + bar_h, &color);
             }
         }
         PaceStyle::Off => {}
