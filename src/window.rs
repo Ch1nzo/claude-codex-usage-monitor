@@ -3579,7 +3579,7 @@ fn draw_usage_bar(
 
     // Pace indicator, drawn inside the bar bounds (does not change width).
     if let Some(exp) = expected {
-        draw_pace_marker(hdc, bar_x, y, bar_w, seg_h, percent, exp, is_dark);
+        draw_pace_marker(hdc, bar_x, y, bar_w, seg_h, percent, exp);
     }
 
     if !text.is_empty() {
@@ -3603,21 +3603,33 @@ fn draw_usage_bar(
     }
 }
 
+/// Fill an axis-aligned rect with a solid color (no-op for an empty rect).
+fn fill_solid_rect(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, color: &Color) {
+    if right <= left || bottom <= top {
+        return;
+    }
+    unsafe {
+        let rect = RECT {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let brush = CreateSolidBrush(COLORREF(color.to_colorref()));
+        FillRect(hdc, &rect, brush);
+        let _ = DeleteObject(brush);
+    }
+}
+
 /// Draw the pace indicator. Green when actual usage is behind the
-/// expected-pace position (headroom), red when ahead (at risk). `Tick` is a
-/// thin vertical line at the expected position; `Solid` fills the gap between
-/// actual usage and the expected position.
-#[allow(clippy::too_many_arguments)]
-fn draw_pace_marker(
-    hdc: HDC,
-    bar_x: i32,
-    y: i32,
-    bar_w: i32,
-    bar_h: i32,
-    percent: f64,
-    expected: f64,
-    is_dark: bool,
-) {
+/// expected-pace position (headroom), red when ahead (at risk).
+///
+/// Uses fixed high-contrast colors with a dark outline so the marker stays
+/// distinct from every bar theme's fill color, and is clipped strictly within
+/// the bar's drawable area. `Tick` is an outlined vertical line at the
+/// expected position; `Solid` marks the gap between actual usage and the
+/// expected position with a reduced-height band plus full-height edge lines.
+fn draw_pace_marker(hdc: HDC, bar_x: i32, y: i32, bar_w: i32, bar_h: i32, percent: f64, expected: f64) {
     let style = pace_style();
     if style == PaceStyle::Off {
         return;
@@ -3625,53 +3637,66 @@ fn draw_pace_marker(
     let actual = (percent / 100.0).clamp(0.0, 1.0);
     let exp = expected.clamp(0.0, 1.0);
     let behind = actual <= exp; // behind pace = headroom = green
+    // High-contrast colors (Option C) chosen to stand out against any theme.
     let color = if behind {
-        if is_dark {
-            Color::from_hex("#3FB950")
-        } else {
-            Color::from_hex("#2EA043")
-        }
-    } else if is_dark {
-        Color::from_hex("#F85149")
+        Color::from_hex("#00FF88") // bright mint
     } else {
-        Color::from_hex("#DA3633")
+        Color::from_hex("#FF4444") // bright red
     };
+    let outline = Color::from_hex("#0A0A0A");
 
-    let exp_x = bar_x + (exp * bar_w as f64).round() as i32;
-    unsafe {
-        match style {
-            PaceStyle::Tick => {
-                let w = sc(2).max(1);
-                let rect = RECT {
-                    left: exp_x - w / 2,
-                    top: y,
-                    right: exp_x - w / 2 + w,
-                    bottom: y + bar_h,
-                };
-                let brush = CreateSolidBrush(COLORREF(color.to_colorref()));
-                FillRect(hdc, &rect, brush);
-                let _ = DeleteObject(brush);
-            }
-            PaceStyle::Solid => {
-                let actual_x = bar_x + (actual * bar_w as f64).round() as i32;
-                let lo = exp_x.min(actual_x);
-                let hi = exp_x.max(actual_x);
-                if hi > lo {
-                    let band_h = (bar_h / 3).max(sc(2));
-                    let top = y + (bar_h - band_h) / 2;
-                    let rect = RECT {
-                        left: lo,
-                        top,
-                        right: hi,
-                        bottom: top + band_h,
-                    };
-                    let brush = CreateSolidBrush(COLORREF(color.to_colorref()));
-                    FillRect(hdc, &rect, brush);
-                    let _ = DeleteObject(brush);
-                }
-            }
-            PaceStyle::Off => {}
+    let bar_right = bar_x + bar_w;
+    let clampx = |v: i32| v.clamp(bar_x, bar_right);
+    let exp_x = clampx(bar_x + (exp * bar_w as f64).round() as i32);
+
+    match style {
+        PaceStyle::Tick => {
+            let core = sc(2).max(2);
+            let half = core / 2;
+            // 1px dark outline, then the colored core on top.
+            fill_solid_rect(
+                hdc,
+                clampx(exp_x - half - 1),
+                y,
+                clampx(exp_x - half - 1 + core + 2),
+                y + bar_h,
+                &outline,
+            );
+            fill_solid_rect(
+                hdc,
+                clampx(exp_x - half),
+                y,
+                clampx(exp_x - half + core),
+                y + bar_h,
+                &color,
+            );
         }
+        PaceStyle::Solid => {
+            let actual_x = clampx(bar_x + (actual * bar_w as f64).round() as i32);
+            let lo = exp_x.min(actual_x);
+            let hi = exp_x.max(actual_x);
+            if hi > lo {
+                // Reduced-height band so the underlying segment grid stays
+                // visible above/below; dark outline keeps it readable.
+                let band_h = (bar_h / 2).max(sc(2));
+                let top = y + (bar_h - band_h) / 2;
+                let bot = top + band_h;
+                fill_solid_rect(
+                    hdc,
+                    clampx(lo - 1),
+                    top - 1,
+                    clampx(hi + 1),
+                    bot + 1,
+                    &outline,
+                );
+                fill_solid_rect(hdc, lo, top, hi, bot, &color);
+                // Full-height edge lines mark the gap boundaries clearly.
+                let ew = sc(1).max(1);
+                fill_solid_rect(hdc, lo, y, clampx(lo + ew), y + bar_h, &color);
+                fill_solid_rect(hdc, clampx(hi - ew), y, hi, y + bar_h, &color);
+            }
+        }
+        PaceStyle::Off => {}
     }
 }
 
