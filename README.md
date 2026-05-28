@@ -186,7 +186,7 @@ If the newer usage endpoint is unavailable, it can fall back to reading the rate
 ## Credits
 
 - Original project: [Claude Code Usage Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) by Craig Constable (MIT License)
-- This fork is maintained by PIARY Co.Ltd
+- This fork is maintained by chinzoe
 
 ## License
 

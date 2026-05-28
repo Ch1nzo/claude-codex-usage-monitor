@@ -13,7 +13,7 @@ Unicode true
 
 !define APP_NAME "Claude & Codex Usage Monitor"
 !define APP_ID "ClaudeCodexUsageMonitor"
-!define PUBLISHER "PIARY Co.Ltd"
+!define PUBLISHER "chinzoe"
 !define VERSION "1.1.0"
 !define EXE_NAME "claude-codex-usage-monitor.exe"
 ; EXE_SOURCE can be overridden on the command line, e.g. in CI which uses the

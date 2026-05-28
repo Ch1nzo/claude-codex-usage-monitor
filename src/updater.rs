@@ -19,7 +19,7 @@ const DOWNLOAD_EXE_NAME: &str = "update-download.exe";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const CREATE_NEW_CONSOLE: u32 = 0x00000010;
 // Keep this aligned with the package identifier used in winget-pkgs.
-const WINGET_PACKAGE_ID: &str = "PIARY.ClaudeCodexUsageMonitor";
+const WINGET_PACKAGE_ID: &str = "chinzoe.ClaudeCodexUsageMonitor";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstallChannel {
