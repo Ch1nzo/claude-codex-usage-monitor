@@ -184,9 +184,6 @@ pub struct Strings {
     pub color_black: &'static str,
     pub show_detailed_remaining: &'static str,
     pub show_pace_indicator: &'static str,
-    pub pace_off: &'static str,
-    pub pace_tick: &'static str,
-    pub pace_solid: &'static str,
 }
 
 pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {

@@ -66,7 +66,5 @@ pub(super) const STRINGS: Strings = Strings {
     color_black: "검정색",
     show_detailed_remaining: "남은 시간 상세 표시",
     show_pace_indicator: "페이스 표시",
-    pace_off: "끄기",
-    pace_tick: "눈금",
-    pace_solid: "막대",
+
 };

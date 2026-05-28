@@ -66,7 +66,5 @@ pub(super) const STRINGS: Strings = Strings {
     color_black: "Black",
     show_detailed_remaining: "Show Detailed Remaining Time",
     show_pace_indicator: "Show Pace Indicator",
-    pace_off: "Off",
-    pace_tick: "Tick",
-    pace_solid: "Solid",
+
 };

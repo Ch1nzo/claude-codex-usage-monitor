@@ -66,7 +66,5 @@ pub(super) const STRINGS: Strings = Strings {
     color_black: "Negro",
     show_detailed_remaining: "Mostrar tiempo restante detallado",
     show_pace_indicator: "Indicador de ritmo",
-    pace_off: "Desactivado",
-    pace_tick: "Marca",
-    pace_solid: "Barra",
+
 };

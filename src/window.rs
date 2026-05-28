@@ -145,9 +145,7 @@ const IDM_TOGGLE_LABELS: u16 = 94;
 const IDM_TOGGLE_PERCENT: u16 = 95;
 const IDM_TOGGLE_TIMER: u16 = 96;
 const IDM_TOGGLE_DETAILED: u16 = 97;
-const IDM_PACE_OFF: u16 = 98;
-const IDM_PACE_TICK: u16 = 99;
-const IDM_PACE_SOLID: u16 = 100;
+const IDM_PACE_TOGGLE: u16 = 98;
 
 const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
 
@@ -277,14 +275,12 @@ fn show_detailed_remaining() -> bool {
 enum PaceStyle {
     Off,
     Tick,
-    Solid,
 }
 
 impl PaceStyle {
     fn from_u8(v: u8) -> Self {
         match v {
             1 => PaceStyle::Tick,
-            2 => PaceStyle::Solid,
             _ => PaceStyle::Off,
         }
     }
@@ -293,7 +289,6 @@ impl PaceStyle {
         match self {
             PaceStyle::Off => 0,
             PaceStyle::Tick => 1,
-            PaceStyle::Solid => 2,
         }
     }
 
@@ -301,14 +296,12 @@ impl PaceStyle {
         match self {
             PaceStyle::Off => "Off",
             PaceStyle::Tick => "Tick",
-            PaceStyle::Solid => "Solid",
         }
     }
 
     fn from_code(code: &str) -> Self {
         match code {
             "Tick" => PaceStyle::Tick,
-            "Solid" => PaceStyle::Solid,
             _ => PaceStyle::Off,
         }
     }
@@ -2801,13 +2794,13 @@ unsafe extern "system" fn wnd_proc(
                     render_layered();
                     schedule_countdown_timer();
                 }
-                IDM_PACE_OFF | IDM_PACE_TICK | IDM_PACE_SOLID => {
-                    let style = match id {
-                        IDM_PACE_TICK => PaceStyle::Tick,
-                        IDM_PACE_SOLID => PaceStyle::Solid,
-                        _ => PaceStyle::Off,
+                IDM_PACE_TOGGLE => {
+                    let next = if pace_style() == PaceStyle::Tick {
+                        PaceStyle::Off
+                    } else {
+                        PaceStyle::Tick
                     };
-                    PACE_STYLE.store(style.to_u8(), Ordering::Relaxed);
+                    PACE_STYLE.store(next.to_u8(), Ordering::Relaxed);
                     save_state_settings();
                     render_layered();
                 }
@@ -3028,39 +3021,18 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(detailed_str.as_ptr()),
         );
 
-        // Pace indicator (radio: Off / Tick / Solid)
-        let cur_pace = pace_style();
-        let pace_menu = CreatePopupMenu().unwrap();
-        for (id, style, label) in [
-            (IDM_PACE_OFF, PaceStyle::Off, strings.pace_off),
-            (IDM_PACE_TICK, PaceStyle::Tick, strings.pace_tick),
-            (IDM_PACE_SOLID, PaceStyle::Solid, strings.pace_solid),
-        ] {
-            let label_str = native_interop::wide_str(label);
-            let flags = if style == cur_pace {
-                MF_CHECKED
-            } else {
-                MENU_ITEM_FLAGS(0)
-            };
-            let _ = AppendMenuW(
-                pace_menu,
-                flags,
-                id as usize,
-                PCWSTR::from_raw(label_str.as_ptr()),
-            );
-        }
-        let pace_label = native_interop::wide_str(strings.show_pace_indicator);
-        // Parent shows a checkmark when a style is active.
-        let pace_parent_flags = if cur_pace == PaceStyle::Off {
-            MF_POPUP
+        // Pace indicator toggle (on = Tick)
+        let pace_str = native_interop::wide_str(strings.show_pace_indicator);
+        let pace_flags = if pace_style() == PaceStyle::Tick {
+            MF_CHECKED
         } else {
-            MF_POPUP | MF_CHECKED
+            MENU_ITEM_FLAGS(0)
         };
         let _ = AppendMenuW(
             appearance_menu,
-            pace_parent_flags,
-            pace_menu.0 as usize,
-            PCWSTR::from_raw(pace_label.as_ptr()),
+            pace_flags,
+            IDM_PACE_TOGGLE as usize,
+            PCWSTR::from_raw(pace_str.as_ptr()),
         );
 
         let _ = AppendMenuW(appearance_menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -3621,17 +3593,13 @@ fn fill_solid_rect(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, color
     }
 }
 
-/// Draw the pace indicator, aligned to the segment grid. Green when actual
-/// usage is behind the expected-pace position (headroom), red when ahead.
+/// Draw the pace indicator: a vertical tick snapped to the nearest segment
+/// boundary at the expected-pace position. Green when actual usage is behind
+/// the expected pace (headroom), red when ahead (at risk).
 ///
-/// Colors are derived from the bar's usage-threshold palette (the same green/
-/// red used by the threshold-coloured bar themes) and brightened so the pace
-/// region reads as a highlighted overlay rather than blending into the fill.
-///
-/// `Solid` recolours the whole segment blocks that fall in the gap between
-/// actual usage and the expected pace (boundary segments filled
-/// proportionally). `Tick` snaps a vertical, outlined line to the nearest
-/// segment boundary at the expected pace.
+/// The color is derived from the bar's usage-threshold palette (the same green/
+/// red used by the threshold-coloured bar themes) and brightened so it stands
+/// out; a dark outline keeps it legible against any theme.
 #[allow(clippy::too_many_arguments)]
 fn draw_pace_marker(
     hdc: HDC,
@@ -3688,32 +3656,6 @@ fn draw_pace_marker(
                 y + bar_h,
                 &color,
             );
-        }
-        PaceStyle::Solid => {
-            let seg_w = sc(SEGMENT_W);
-            let seg_gap = sc(SEGMENT_GAP);
-            let lo_r = actual.min(exp);
-            let hi_r = actual.max(exp);
-            if hi_r <= lo_r {
-                return;
-            }
-            let seg_ratio = 1.0 / segment_count as f64;
-            for i in 0..segment_count {
-                let seg_start = i as f64 * seg_ratio;
-                let seg_end = seg_start + seg_ratio;
-                let ov_start = seg_start.max(lo_r);
-                let ov_end = seg_end.min(hi_r);
-                if ov_end <= ov_start {
-                    continue;
-                }
-                // Recolour the (possibly partial) gap portion of this segment.
-                let seg_x = bar_x + i * (seg_w + seg_gap);
-                let f0 = ((ov_start - seg_start) / seg_ratio).clamp(0.0, 1.0);
-                let f1 = ((ov_end - seg_start) / seg_ratio).clamp(0.0, 1.0);
-                let px0 = seg_x + (f0 * seg_w as f64).round() as i32;
-                let px1 = seg_x + (f1 * seg_w as f64).round() as i32;
-                fill_solid_rect(hdc, clampx(px0), y, clampx(px1), y + bar_h, &color);
-            }
         }
         PaceStyle::Off => {}
     }

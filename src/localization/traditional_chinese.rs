@@ -66,7 +66,5 @@ pub(super) const STRINGS: Strings = Strings {
     color_black: "黑色",
     show_detailed_remaining: "顯示詳細剩餘時間",
     show_pace_indicator: "進度指示器",
-    pace_off: "關閉",
-    pace_tick: "刻度",
-    pace_solid: "色塊",
+
 };

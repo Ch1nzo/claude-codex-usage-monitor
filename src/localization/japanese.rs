@@ -66,7 +66,5 @@ pub(super) const STRINGS: Strings = Strings {
     color_black: "ブラック",
     show_detailed_remaining: "残り時間を詳細表示",
     show_pace_indicator: "ペースインジケーター",
-    pace_off: "オフ",
-    pace_tick: "目盛り",
-    pace_solid: "塗りつぶし",
+
 };
