@@ -2831,6 +2831,7 @@ fn show_context_menu(hwnd: HWND) {
 
         let menu = CreatePopupMenu().unwrap();
 
+        // Quick actions
         let refresh_str = native_interop::wide_str(strings.refresh);
         let _ = AppendMenuW(
             menu,
@@ -2839,36 +2840,20 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(refresh_str.as_ptr()),
         );
 
-        // Update Frequency submenu
-        let freq_menu = CreatePopupMenu().unwrap();
-        let freq_items: [(u16, u32, &str); 4] = [
-            (IDM_FREQ_1MIN, POLL_1_MIN, strings.one_minute),
-            (IDM_FREQ_5MIN, POLL_5_MIN, strings.five_minutes),
-            (IDM_FREQ_15MIN, POLL_15_MIN, strings.fifteen_minutes),
-            (IDM_FREQ_1HOUR, POLL_1_HOUR, strings.one_hour),
-        ];
-        for (id, interval, label) in freq_items {
-            let label_str = native_interop::wide_str(label);
-            let flags = if interval == current_interval {
-                MF_CHECKED
-            } else {
-                MENU_ITEM_FLAGS(0)
-            };
-            let _ = AppendMenuW(
-                freq_menu,
-                flags,
-                id as usize,
-                PCWSTR::from_raw(label_str.as_ptr()),
-            );
-        }
-
-        let freq_label = native_interop::wide_str(strings.update_frequency);
+        let widget_label = native_interop::wide_str(strings.show_widget);
+        let widget_flags = if widget_visible {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
         let _ = AppendMenuW(
             menu,
-            MF_POPUP,
-            freq_menu.0 as usize,
-            PCWSTR::from_raw(freq_label.as_ptr()),
+            widget_flags,
+            tray_icon::IDM_TOGGLE_WIDGET as usize,
+            PCWSTR::from_raw(widget_label.as_ptr()),
         );
+
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
         // Models submenu
         let models_menu = CreatePopupMenu().unwrap();
@@ -2884,7 +2869,6 @@ fn show_context_menu(hwnd: HWND) {
             IDM_MODEL_CLAUDE_CODE as usize,
             PCWSTR::from_raw(claude_model.as_ptr()),
         );
-
         let codex_model = native_interop::wide_str(strings.codex_model);
         let codex_flags = if show_codex {
             MF_CHECKED
@@ -2897,7 +2881,6 @@ fn show_context_menu(hwnd: HWND) {
             IDM_MODEL_CODEX as usize,
             PCWSTR::from_raw(codex_model.as_ptr()),
         );
-
         let models_label = native_interop::wide_str(strings.models);
         let _ = AppendMenuW(
             menu,
@@ -2906,7 +2889,9 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(models_label.as_ptr()),
         );
 
-        // Bar Style submenu (top-level)
+        // Appearance submenu: bar style, segments, element toggles, characters
+        let appearance_menu = CreatePopupMenu().unwrap();
+
         let bar_style_menu = CreatePopupMenu().unwrap();
         let current_theme = current_bar_theme();
         for theme in BarTheme::ALL {
@@ -2931,13 +2916,49 @@ fn show_context_menu(hwnd: HWND) {
         }
         let bar_style_label = native_interop::wide_str(strings.bar_style);
         let _ = AppendMenuW(
-            menu,
+            appearance_menu,
             MF_POPUP,
             bar_style_menu.0 as usize,
             PCWSTR::from_raw(bar_style_label.as_ptr()),
         );
 
-        // Characters submenu (top-level)
+        let seg_menu = CreatePopupMenu().unwrap();
+        let cur_seg = current_segment_count();
+        for (id, n) in [(IDM_SEG_4, 4), (IDM_SEG_6, 6), (IDM_SEG_8, 8), (IDM_SEG_10, 10)] {
+            let label = native_interop::wide_str(&n.to_string());
+            let flags = if n == cur_seg {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(seg_menu, flags, id as usize, PCWSTR::from_raw(label.as_ptr()));
+        }
+        let seg_label = native_interop::wide_str(strings.segment_count);
+        let _ = AppendMenuW(
+            appearance_menu,
+            MF_POPUP,
+            seg_menu.0 as usize,
+            PCWSTR::from_raw(seg_label.as_ptr()),
+        );
+
+        for (id, label, on) in [
+            (IDM_TOGGLE_LABELS, strings.show_labels, show_labels()),
+            (IDM_TOGGLE_PERCENT, strings.show_percentages, show_percentages()),
+            (IDM_TOGGLE_TIMER, strings.show_reset_timer, show_reset_timer()),
+        ] {
+            let label_str = native_interop::wide_str(label);
+            let flags = if on { MF_CHECKED } else { MENU_ITEM_FLAGS(0) };
+            let _ = AppendMenuW(
+                appearance_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label_str.as_ptr()),
+            );
+        }
+
+        let _ = AppendMenuW(appearance_menu, MF_SEPARATOR, 0, PCWSTR::null());
+
+        // Characters submenu (nested under Appearance)
         let characters_menu = CreatePopupMenu().unwrap();
         let show_chars_str = native_interop::wide_str(strings.show_characters);
         let show_chars_flags = if character::is_enabled() {
@@ -2953,12 +2974,11 @@ fn show_context_menu(hwnd: HWND) {
         );
         let _ = AppendMenuW(characters_menu, MF_SEPARATOR, 0, PCWSTR::null());
         let current_kind = character::current_kind();
-        let kind_items: [(u16, CharacterKind, &str); 3] = [
+        for (id, kind, label) in [
             (IDM_CHAR_CAT, CharacterKind::Cat, strings.character_cat),
             (IDM_CHAR_DOG, CharacterKind::Dog, strings.character_dog),
             (IDM_CHAR_BOTH, CharacterKind::Both, strings.character_both),
-        ];
-        for (id, kind, label) in kind_items {
+        ] {
             let label_str = native_interop::wide_str(label);
             let flags = if kind == current_kind {
                 MF_CHECKED
@@ -2972,8 +2992,6 @@ fn show_context_menu(hwnd: HWND) {
                 PCWSTR::from_raw(label_str.as_ptr()),
             );
         }
-
-        // Color variant submenus
         let _ = AppendMenuW(characters_menu, MF_SEPARATOR, 0, PCWSTR::null());
         let cat_var = character::cat_variant();
         let cat_color_menu = CreatePopupMenu().unwrap();
@@ -3001,7 +3019,6 @@ fn show_context_menu(hwnd: HWND) {
             cat_color_menu.0 as usize,
             PCWSTR::from_raw(cat_color_label.as_ptr()),
         );
-
         let dog_var = character::dog_variant();
         let dog_color_menu = CreatePopupMenu().unwrap();
         for (id, v, label) in [
@@ -3028,17 +3045,52 @@ fn show_context_menu(hwnd: HWND) {
             dog_color_menu.0 as usize,
             PCWSTR::from_raw(dog_color_label.as_ptr()),
         );
-
         let characters_label = native_interop::wide_str(strings.characters);
         let _ = AppendMenuW(
-            menu,
+            appearance_menu,
             MF_POPUP,
             characters_menu.0 as usize,
             PCWSTR::from_raw(characters_label.as_ptr()),
         );
 
+        let appearance_label = native_interop::wide_str(strings.appearance);
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            appearance_menu.0 as usize,
+            PCWSTR::from_raw(appearance_label.as_ptr()),
+        );
+
         // Settings submenu
         let settings_menu = CreatePopupMenu().unwrap();
+
+        let freq_menu = CreatePopupMenu().unwrap();
+        for (id, interval, label) in [
+            (IDM_FREQ_1MIN, POLL_1_MIN, strings.one_minute),
+            (IDM_FREQ_5MIN, POLL_5_MIN, strings.five_minutes),
+            (IDM_FREQ_15MIN, POLL_15_MIN, strings.fifteen_minutes),
+            (IDM_FREQ_1HOUR, POLL_1_HOUR, strings.one_hour),
+        ] {
+            let label_str = native_interop::wide_str(label);
+            let flags = if interval == current_interval {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                freq_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label_str.as_ptr()),
+            );
+        }
+        let freq_label = native_interop::wide_str(strings.update_frequency);
+        let _ = AppendMenuW(
+            settings_menu,
+            MF_POPUP,
+            freq_menu.0 as usize,
+            PCWSTR::from_raw(freq_label.as_ptr()),
+        );
 
         let startup_str = native_interop::wide_str(strings.start_with_windows);
         let startup_flags = if is_startup_enabled() {
@@ -3059,56 +3111,6 @@ fn show_context_menu(hwnd: HWND) {
             MENU_ITEM_FLAGS(0),
             IDM_RESET_POSITION as usize,
             PCWSTR::from_raw(reset_pos_str.as_ptr()),
-        );
-
-        // Display submenu: segment count + element toggles
-        let display_menu = CreatePopupMenu().unwrap();
-        let seg_menu = CreatePopupMenu().unwrap();
-        let cur_seg = current_segment_count();
-        let seg_items: [(u16, i32); 4] = [
-            (IDM_SEG_4, 4),
-            (IDM_SEG_6, 6),
-            (IDM_SEG_8, 8),
-            (IDM_SEG_10, 10),
-        ];
-        for (id, n) in seg_items {
-            let label = native_interop::wide_str(&n.to_string());
-            let flags = if n == cur_seg {
-                MF_CHECKED
-            } else {
-                MENU_ITEM_FLAGS(0)
-            };
-            let _ = AppendMenuW(seg_menu, flags, id as usize, PCWSTR::from_raw(label.as_ptr()));
-        }
-        let seg_label = native_interop::wide_str(strings.segment_count);
-        let _ = AppendMenuW(
-            display_menu,
-            MF_POPUP,
-            seg_menu.0 as usize,
-            PCWSTR::from_raw(seg_label.as_ptr()),
-        );
-        let _ = AppendMenuW(display_menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let toggle_items: [(u16, &str, bool); 3] = [
-            (IDM_TOGGLE_LABELS, strings.show_labels, show_labels()),
-            (IDM_TOGGLE_PERCENT, strings.show_percentages, show_percentages()),
-            (IDM_TOGGLE_TIMER, strings.show_reset_timer, show_reset_timer()),
-        ];
-        for (id, label, on) in toggle_items {
-            let label_str = native_interop::wide_str(label);
-            let flags = if on { MF_CHECKED } else { MENU_ITEM_FLAGS(0) };
-            let _ = AppendMenuW(
-                display_menu,
-                flags,
-                id as usize,
-                PCWSTR::from_raw(label_str.as_ptr()),
-            );
-        }
-        let display_label = native_interop::wide_str(strings.display);
-        let _ = AppendMenuW(
-            settings_menu,
-            MF_POPUP,
-            display_menu.0 as usize,
-            PCWSTR::from_raw(display_label.as_ptr()),
         );
 
         let language_menu = CreatePopupMenu().unwrap();
@@ -3184,19 +3186,6 @@ fn show_context_menu(hwnd: HWND) {
             MF_POPUP,
             settings_menu.0 as usize,
             PCWSTR::from_raw(settings_label.as_ptr()),
-        );
-
-        let widget_label = native_interop::wide_str(strings.show_widget);
-        let widget_flags = if widget_visible {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            menu,
-            widget_flags,
-            tray_icon::IDM_TOGGLE_WIDGET as usize,
-            PCWSTR::from_raw(widget_label.as_ptr()),
         );
 
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());

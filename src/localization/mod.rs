@@ -171,7 +171,7 @@ pub struct Strings {
     pub character_cat: &'static str,
     pub character_dog: &'static str,
     pub character_both: &'static str,
-    pub display: &'static str,
+    pub appearance: &'static str,
     pub segment_count: &'static str,
     pub show_labels: &'static str,
     pub show_percentages: &'static str,

@@ -53,7 +53,7 @@ pub(super) const STRINGS: Strings = Strings {
     character_cat: "고양이",
     character_dog: "개",
     character_both: "둘 다",
-    display: "표시",
+    appearance: "모양",
     segment_count: "세그먼트 수",
     show_labels: "라벨 표시",
     show_percentages: "퍼센트 표시",

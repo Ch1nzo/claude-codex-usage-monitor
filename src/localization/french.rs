@@ -53,7 +53,7 @@ pub(super) const STRINGS: Strings = Strings {
     character_cat: "Chat",
     character_dog: "Chien",
     character_both: "Les deux",
-    display: "Affichage",
+    appearance: "Apparence",
     segment_count: "Nombre de segments",
     show_labels: "Afficher les libellés",
     show_percentages: "Afficher les pourcentages",
