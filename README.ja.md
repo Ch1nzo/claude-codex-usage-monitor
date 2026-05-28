@@ -201,7 +201,7 @@ claude-codex-usage-monitor --diagnose
 ## クレジット
 
 - 元プロジェクト：[Claude Code Usage Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) by Craig Constable（MIT ライセンス）
-- 本フォークの保守：chinzoe
+- 本フォークの保守：Chinzoe
 
 ## ライセンス
 

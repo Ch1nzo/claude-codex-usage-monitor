@@ -7,13 +7,13 @@ description = "Claude & Codex usage monitor for the Windows taskbar"
 repository = "https://github.com/Ch1nzo/claude-codex-usage-monitor"
 
 [package.metadata.winres]
-CompanyName = "chinzoe"
+CompanyName = "Chinzoe"
 ProductName = "Claude & Codex Usage Monitor"
 FileDescription = "Claude & Codex Usage Monitor"
 OriginalFilename = "claude-codex-usage-monitor.exe"
 InternalName = "ClaudeCodexUsageMonitor"
 Comments = "https://github.com/Ch1nzo/claude-codex-usage-monitor"
-LegalCopyright = "Copyright (C) 2026 chinzoe. Based on Claude Code Usage Monitor (C) 2025 Craig Constable. MIT License."
+LegalCopyright = "Copyright (C) 2026 Chinzoe. Based on Claude Code Usage Monitor (C) 2025 Craig Constable. MIT License."
 
 [dependencies]
 ureq = { version = "2", default-features = false, features = ["native-tls", "json", "proxy-from-env"] }
