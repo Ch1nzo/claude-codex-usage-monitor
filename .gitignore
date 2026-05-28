@@ -24,3 +24,6 @@ workflow.cmd
 
 # Local WinGet manifest generation output
 /manifests/
+
+# Generated installer output
+*-setup.exe
