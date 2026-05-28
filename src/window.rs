@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -133,6 +133,14 @@ const IDM_CHAR_CAT: u16 = 81;
 const IDM_CHAR_DOG: u16 = 82;
 const IDM_CHAR_BOTH: u16 = 83;
 
+const IDM_SEG_4: u16 = 90;
+const IDM_SEG_6: u16 = 91;
+const IDM_SEG_8: u16 = 92;
+const IDM_SEG_10: u16 = 93;
+const IDM_TOGGLE_LABELS: u16 = 94;
+const IDM_TOGGLE_PERCENT: u16 = 95;
+const IDM_TOGGLE_TIMER: u16 = 96;
+
 const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
@@ -222,6 +230,39 @@ fn current_bar_theme() -> BarTheme {
     BarTheme::from_u8(CURRENT_BAR_THEME.load(Ordering::Relaxed))
 }
 
+/// Configurable compact-UI state, kept lock-free so the paint and width-calc
+/// paths can read it without the state lock.
+static CURRENT_SEGMENT_COUNT: AtomicU8 = AtomicU8::new(10);
+static SHOW_LABELS: AtomicBool = AtomicBool::new(true);
+static SHOW_PERCENTAGES: AtomicBool = AtomicBool::new(true);
+static SHOW_RESET_TIMER: AtomicBool = AtomicBool::new(true);
+
+fn current_segment_count() -> i32 {
+    match CURRENT_SEGMENT_COUNT.load(Ordering::Relaxed) {
+        4 => 4,
+        6 => 6,
+        8 => 8,
+        _ => 10,
+    }
+}
+
+fn show_labels() -> bool {
+    SHOW_LABELS.load(Ordering::Relaxed)
+}
+
+fn show_percentages() -> bool {
+    SHOW_PERCENTAGES.load(Ordering::Relaxed)
+}
+
+fn show_reset_timer() -> bool {
+    SHOW_RESET_TIMER.load(Ordering::Relaxed)
+}
+
+/// Whether the text column (percentage and/or countdown) is shown at all.
+fn text_area_shown() -> bool {
+    show_percentages() || show_reset_timer()
+}
+
 /// Scale a base pixel value (designed at 96 DPI) to the current DPI.
 fn sc(px: i32) -> i32 {
     let dpi = CURRENT_DPI.load(Ordering::Relaxed);
@@ -308,6 +349,14 @@ struct SettingsFile {
     characters_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     character_kind: Option<String>,
+    #[serde(default = "default_segment_count")]
+    segment_count: u8,
+    #[serde(default = "default_true")]
+    show_labels: bool,
+    #[serde(default = "default_true")]
+    show_percentages: bool,
+    #[serde(default = "default_true")]
+    show_reset_timer: bool,
 }
 
 impl Default for SettingsFile {
@@ -323,6 +372,10 @@ impl Default for SettingsFile {
             bar_theme: None,
             characters_enabled: true,
             character_kind: None,
+            segment_count: 10,
+            show_labels: true,
+            show_percentages: true,
+            show_reset_timer: true,
         }
     }
 }
@@ -344,6 +397,14 @@ fn default_show_codex() -> bool {
 }
 
 fn default_characters_enabled() -> bool {
+    true
+}
+
+fn default_segment_count() -> u8 {
+    10
+}
+
+fn default_true() -> bool {
     true
 }
 
@@ -385,6 +446,10 @@ fn save_state_settings() {
             bar_theme: Some(current_bar_theme().code().to_string()),
             characters_enabled: character::is_enabled(),
             character_kind: Some(character::current_kind().code().to_string()),
+            segment_count: current_segment_count() as u8,
+            show_labels: show_labels(),
+            show_percentages: show_percentages(),
+            show_reset_timer: show_reset_timer(),
         });
     }
 }
@@ -518,21 +583,23 @@ fn refresh_usage_texts(state: &mut AppState) {
     }
 
     let strings = state.language.strings();
+    let sp = show_percentages();
+    let st = show_reset_timer();
     let Some(data) = state.data.as_ref() else {
         return;
     };
 
     if let Some(claude_code) = data.claude_code.as_ref() {
-        state.session_text = poller::format_line(&claude_code.session, strings);
-        state.weekly_text = poller::format_line(&claude_code.weekly, strings);
+        state.session_text = poller::format_line(&claude_code.session, strings, sp, st);
+        state.weekly_text = poller::format_line(&claude_code.weekly, strings, sp, st);
     } else if state.show_claude_code {
         state.session_text = "!".to_string();
         state.weekly_text = "!".to_string();
     }
 
     if let Some(codex) = data.codex.as_ref() {
-        state.codex_session_text = poller::format_line(&codex.session, strings);
-        state.codex_weekly_text = poller::format_line(&codex.weekly, strings);
+        state.codex_session_text = poller::format_line(&codex.session, strings, sp, st);
+        state.codex_weekly_text = poller::format_line(&codex.weekly, strings, sp, st);
     } else if state.show_codex {
         state.codex_session_text = "!".to_string();
         state.codex_weekly_text = "!".to_string();
@@ -912,7 +979,6 @@ fn set_startup_enabled(enable: bool) {
 const SEGMENT_W: i32 = 10;
 const SEGMENT_H: i32 = 13;
 const SEGMENT_GAP: i32 = 1;
-const SEGMENT_COUNT: i32 = 10;
 const CORNER_RADIUS: i32 = 2;
 
 const LEFT_DIVIDER_W: i32 = 3;
@@ -929,24 +995,22 @@ fn active_model_count(show_claude_code: bool, show_codex: bool) -> i32 {
     (show_claude_code as i32 + show_codex as i32).max(1)
 }
 
-fn row_bar_segment_count(active_models: i32) -> i32 {
-    if active_models > 1 {
-        5
-    } else {
-        SEGMENT_COUNT
-    }
+fn row_bar_segment_count(_active_models: i32) -> i32 {
+    // User-configurable; applied uniformly to every bar.
+    current_segment_count()
 }
 
 fn total_widget_width_for(active_models: i32) -> i32 {
-    let bar_segments = row_bar_segment_count(active_models);
-    let model_width = (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * bar_segments - sc(SEGMENT_GAP)
-        + sc(BAR_RIGHT_MARGIN)
-        + sc(TEXT_WIDTH);
+    let label_part = if show_labels() {
+        sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN)
+    } else {
+        0
+    };
+    let model_width = model_usage_width(current_segment_count());
 
     sc(LEFT_DIVIDER_W)
         + sc(DIVIDER_RIGHT_MARGIN)
-        + sc(LABEL_WIDTH)
-        + sc(LABEL_RIGHT_MARGIN)
+        + label_part
         + model_width * active_models
         + sc(MODEL_RIGHT_MARGIN) * (active_models - 1)
         + sc(RIGHT_MARGIN)
@@ -1081,6 +1145,10 @@ pub fn run() {
             .and_then(BarTheme::from_code)
             .unwrap_or(BarTheme::Segmented);
         CURRENT_BAR_THEME.store(initial_bar_theme.to_u8(), Ordering::Relaxed);
+        CURRENT_SEGMENT_COUNT.store(settings.segment_count, Ordering::Relaxed);
+        SHOW_LABELS.store(settings.show_labels, Ordering::Relaxed);
+        SHOW_PERCENTAGES.store(settings.show_percentages, Ordering::Relaxed);
+        SHOW_RESET_TIMER.store(settings.show_reset_timer, Ordering::Relaxed);
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
@@ -2505,6 +2573,41 @@ unsafe extern "system" fn wnd_proc(
                     character::set_kind(kind);
                     save_state_settings();
                 }
+                IDM_SEG_4 | IDM_SEG_6 | IDM_SEG_8 | IDM_SEG_10 => {
+                    let n: u8 = match id {
+                        IDM_SEG_4 => 4,
+                        IDM_SEG_6 => 6,
+                        IDM_SEG_8 => 8,
+                        _ => 10,
+                    };
+                    CURRENT_SEGMENT_COUNT.store(n, Ordering::Relaxed);
+                    save_state_settings();
+                    // Width changes, so reposition before re-rendering.
+                    position_at_taskbar();
+                    render_layered();
+                }
+                IDM_TOGGLE_LABELS | IDM_TOGGLE_PERCENT | IDM_TOGGLE_TIMER => {
+                    match id {
+                        IDM_TOGGLE_LABELS => {
+                            SHOW_LABELS.fetch_xor(true, Ordering::Relaxed);
+                        }
+                        IDM_TOGGLE_PERCENT => {
+                            SHOW_PERCENTAGES.fetch_xor(true, Ordering::Relaxed);
+                        }
+                        _ => {
+                            SHOW_RESET_TIMER.fetch_xor(true, Ordering::Relaxed);
+                        }
+                    }
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            refresh_usage_texts(s);
+                        }
+                    }
+                    save_state_settings();
+                    position_at_taskbar();
+                    render_layered();
+                }
                 id if id == tray_icon::IDM_TOGGLE_WIDGET => {
                     toggle_widget_visibility(hwnd);
                 }
@@ -2756,6 +2859,56 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(reset_pos_str.as_ptr()),
         );
 
+        // Display submenu: segment count + element toggles
+        let display_menu = CreatePopupMenu().unwrap();
+        let seg_menu = CreatePopupMenu().unwrap();
+        let cur_seg = current_segment_count();
+        let seg_items: [(u16, i32); 4] = [
+            (IDM_SEG_4, 4),
+            (IDM_SEG_6, 6),
+            (IDM_SEG_8, 8),
+            (IDM_SEG_10, 10),
+        ];
+        for (id, n) in seg_items {
+            let label = native_interop::wide_str(&n.to_string());
+            let flags = if n == cur_seg {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(seg_menu, flags, id as usize, PCWSTR::from_raw(label.as_ptr()));
+        }
+        let seg_label = native_interop::wide_str(strings.segment_count);
+        let _ = AppendMenuW(
+            display_menu,
+            MF_POPUP,
+            seg_menu.0 as usize,
+            PCWSTR::from_raw(seg_label.as_ptr()),
+        );
+        let _ = AppendMenuW(display_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let toggle_items: [(u16, &str, bool); 3] = [
+            (IDM_TOGGLE_LABELS, strings.show_labels, show_labels()),
+            (IDM_TOGGLE_PERCENT, strings.show_percentages, show_percentages()),
+            (IDM_TOGGLE_TIMER, strings.show_reset_timer, show_reset_timer()),
+        ];
+        for (id, label, on) in toggle_items {
+            let label_str = native_interop::wide_str(label);
+            let flags = if on { MF_CHECKED } else { MENU_ITEM_FLAGS(0) };
+            let _ = AppendMenuW(
+                display_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label_str.as_ptr()),
+            );
+        }
+        let display_label = native_interop::wide_str(strings.display);
+        let _ = AppendMenuW(
+            settings_menu,
+            MF_POPUP,
+            display_menu.0 as usize,
+            PCWSTR::from_raw(display_label.as_ptr()),
+        );
+
         let language_menu = CreatePopupMenu().unwrap();
         let system_label = native_interop::wide_str(strings.system_default);
         let system_flags = if language_override.is_none() {
@@ -2994,22 +3147,24 @@ fn draw_row(
     };
 
     unsafe {
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-        let mut label_wide: Vec<u16> = label.encode_utf16().collect();
-        let mut label_rect = RECT {
-            left: x,
-            top: y,
-            right: x + sc(LABEL_WIDTH),
-            bottom: y + seg_h,
-        };
-        let _ = DrawTextW(
-            hdc,
-            &mut label_wide,
-            &mut label_rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-        );
-
-        let mut model_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
+        let mut model_x = x;
+        if show_labels() {
+            let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+            let mut label_wide: Vec<u16> = label.encode_utf16().collect();
+            let mut label_rect = RECT {
+                left: x,
+                top: y,
+                right: x + sc(LABEL_WIDTH),
+                bottom: y + seg_h,
+            };
+            let _ = DrawTextW(
+                hdc,
+                &mut label_wide,
+                &mut label_rect,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+            model_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
+        }
         if show_claude_code {
             draw_usage_bar(
                 hdc,
@@ -3043,9 +3198,12 @@ fn draw_row(
 }
 
 fn model_usage_width(segment_count: i32) -> i32 {
-    (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP)
-        + sc(BAR_RIGHT_MARGIN)
-        + sc(TEXT_WIDTH)
+    let bar_w = (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP);
+    if text_area_shown() {
+        bar_w + sc(BAR_RIGHT_MARGIN) + sc(TEXT_WIDTH)
+    } else {
+        bar_w
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -1020,14 +1020,29 @@ fn is_leap(y: u64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-/// Format a usage section as "X% · Yh" style text
-pub fn format_line(section: &UsageSection, strings: Strings) -> String {
-    let pct = format!("{:.0}%", section.percentage);
-    let cd = format_countdown(section.resets_at, strings);
-    if cd.is_empty() {
-        pct
+/// Format a usage section as "X% · Yh" style text. `show_pct` / `show_cd`
+/// independently include the percentage and the reset countdown.
+pub fn format_line(
+    section: &UsageSection,
+    strings: Strings,
+    show_pct: bool,
+    show_cd: bool,
+) -> String {
+    let pct = if show_pct {
+        format!("{:.0}%", section.percentage)
     } else {
-        format!("{pct} \u{00b7} {cd}")
+        String::new()
+    };
+    let cd = if show_cd {
+        format_countdown(section.resets_at, strings)
+    } else {
+        String::new()
+    };
+    match (pct.is_empty(), cd.is_empty()) {
+        (false, false) => format!("{pct} \u{00b7} {cd}"),
+        (false, true) => pct,
+        (true, false) => cd,
+        (true, true) => String::new(),
     }
 }
 

@@ -53,4 +53,9 @@ pub(super) const STRINGS: Strings = Strings {
     character_cat: "貓",
     character_dog: "狗",
     character_both: "兩者",
+    display: "顯示",
+    segment_count: "分段數",
+    show_labels: "顯示標籤",
+    show_percentages: "顯示百分比",
+    show_reset_timer: "顯示重置計時器",
 };

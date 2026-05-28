@@ -53,4 +53,9 @@ pub(super) const STRINGS: Strings = Strings {
     character_cat: "Katze",
     character_dog: "Hund",
     character_both: "Beide",
+    display: "Anzeige",
+    segment_count: "Segmentanzahl",
+    show_labels: "Beschriftungen anzeigen",
+    show_percentages: "Prozente anzeigen",
+    show_reset_timer: "Reset-Timer anzeigen",
 };
