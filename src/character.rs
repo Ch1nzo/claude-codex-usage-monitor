@@ -620,8 +620,20 @@ fn prediction_message(lang: LanguageId, is_cat: bool, hhmm: &str) -> String {
     match (lang, is_cat) {
         (LanguageId::Japanese, true) => format!("このペースだと{hhmm}に上限かも…"),
         (LanguageId::Japanese, false) => format!("このままだと{hhmm}で限界だワン！"),
-        (_, true) => format!("at this pace... done by {hhmm}."),
-        (_, false) => format!("uh oh, 100% by {hhmm}!!"),
+        (LanguageId::German, true) => format!("in dem Tempo... um {hhmm} vorbei."),
+        (LanguageId::German, false) => format!("oje, 100% um {hhmm}!!"),
+        (LanguageId::Dutch, true) => format!("in dit tempo... om {hhmm} op."),
+        (LanguageId::Dutch, false) => format!("oei, 100% om {hhmm}!!"),
+        (LanguageId::Spanish, true) => format!("a este ritmo... listo a las {hhmm}."),
+        (LanguageId::Spanish, false) => format!("¡¡uy, 100% a las {hhmm}!!"),
+        (LanguageId::French, true) => format!("à ce rythme... fini à {hhmm}."),
+        (LanguageId::French, false) => format!("oh là, 100% à {hhmm} !!"),
+        (LanguageId::Korean, true) => format!("이 속도면... {hhmm}에 끝."),
+        (LanguageId::Korean, false) => format!("이런, {hhmm}에 100%!!"),
+        (LanguageId::TraditionalChinese, true) => format!("照這速度…{hhmm}就到頂了。"),
+        (LanguageId::TraditionalChinese, false) => format!("糟糕，{hhmm}就100%！！"),
+        (LanguageId::English, true) => format!("at this pace... done by {hhmm}."),
+        (LanguageId::English, false) => format!("uh oh, 100% by {hhmm}!!"),
     }
 }
 
@@ -1534,13 +1546,19 @@ fn draw_bubble(
 
 // ----- localized message pools ----------------------------------------------
 // Cat = aloof / sarcastic / occasionally cute. Dog = eager / energetic.
-// Japanese and English are provided; other languages fall back to English,
-// consistent with keeping all strings embedded in the binary.
+// All eight UI languages have their own pools (translations preserve each
+// character's personality rather than being literal).
 
 fn message_pool(lang: LanguageId, is_cat: bool, pool: Pool) -> &'static [&'static str] {
     match lang {
         LanguageId::Japanese => ja_pool(is_cat, pool),
-        _ => en_pool(is_cat, pool),
+        LanguageId::German => de_pool(is_cat, pool),
+        LanguageId::Dutch => nl_pool(is_cat, pool),
+        LanguageId::Spanish => es_pool(is_cat, pool),
+        LanguageId::French => fr_pool(is_cat, pool),
+        LanguageId::Korean => ko_pool(is_cat, pool),
+        LanguageId::TraditionalChinese => zh_pool(is_cat, pool),
+        LanguageId::English => en_pool(is_cat, pool),
     }
 }
 
@@ -1620,6 +1638,252 @@ fn en_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["uh oh!!", "almost maxed!!", "over 90%! careful!!"],
             Pool::Rest => &["great job today!!", "you did it!!", "so proud!!"],
             Pool::Encourage => &["doing great!!", "keep going!!", "you got this!!"],
+        }
+    }
+}
+
+fn de_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
+    if is_cat {
+        match pool {
+            Pool::Hover => &[
+                "...was willst du.",
+                "ach, du bist's.",
+                "starrst du mich an?",
+                "ja?",
+                "...na gut, schau.",
+            ],
+            Pool::Click => &[
+                "muss das sein.",
+                "...pff.",
+                "schon wieder? meinetwegen.",
+                "stört's dich?",
+                "na schön.",
+            ],
+            Pool::Idle => &["zzz...", "so langweilig.", "...", "*streck*"],
+            Pool::Soft => &["mach mal langsam?", "über 80%, weißt du.", "das ist viel..."],
+            Pool::Urgent => &["das ist schlecht.", "fast am Limit.", "über 90%. nicht mein Problem."],
+            Pool::Rest => &["...gut gemacht.", "nicht übel, schätze ich.", "ruh dich aus."],
+            Pool::Encourage => &["läuft doch.", "noch genug übrig.", "pff, nicht schlecht."],
+        }
+    } else {
+        match pool {
+            Pool::Hover => &[
+                "HI HI HI!! 🐾",
+                "spielen?? spielen??",
+                "schau mich an!!",
+                "oh Mann oh Mann!",
+                "hier rüber!!",
+            ],
+            Pool::Click => &[
+                "JAJAJA!!",
+                "nochmal nochmal!! 🐾",
+                "bester Tag ever!!",
+                "streichel mich mehr!!",
+                "juhuu!!",
+            ],
+            Pool::Idle => &["so langweilig wuff", "lass uns spielen!", "*wedelt*", "Gassi??"],
+            Pool::Soft => &["vorsicht jetzt!", "über 80%!", "das ist ganz schön viel!"],
+            Pool::Urgent => &["oh oh!!", "fast am Limit!!", "über 90%! vorsicht!!"],
+            Pool::Rest => &["super gemacht heute!!", "geschafft!!", "so stolz!!"],
+            Pool::Encourage => &["läuft super!!", "weiter so!!", "du schaffst das!!"],
+        }
+    }
+}
+
+fn nl_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
+    if is_cat {
+        match pool {
+            Pool::Hover => &[
+                "...wat wil je.",
+                "oh, jij bent het.",
+                "zit je te staren?",
+                "ja?",
+                "...goed, kijk dan.",
+            ],
+            Pool::Click => &[
+                "moet dat nou.",
+                "...pff.",
+                "alweer? mij best.",
+                "stoor ik?",
+                "vooruit dan maar.",
+            ],
+            Pool::Idle => &["zzz...", "zo saai.", "...", "*rek uit*"],
+            Pool::Soft => &["rustig aan?", "boven de 80%, hoor.", "dat is veel..."],
+            Pool::Urgent => &["dit is slecht.", "bijna op.", "boven 90%. niet mijn probleem."],
+            Pool::Rest => &["...goed gedaan.", "niet slecht, denk ik.", "ga maar rusten."],
+            Pool::Encourage => &["gaat prima.", "nog genoeg over.", "pff, niet slecht."],
+        }
+    } else {
+        match pool {
+            Pool::Hover => &[
+                "HOI HOI HOI!! 🐾",
+                "spelen?? spelen??",
+                "kijk naar mij!!",
+                "oh jee oh jee!",
+                "hierheen!!",
+            ],
+            Pool::Click => &[
+                "JAJAJA!!",
+                "nog een keer!! 🐾",
+                "beste dag ooit!!",
+                "aai me meer!!",
+                "joepie!!",
+            ],
+            Pool::Idle => &["zo saai woef", "laten we spelen!", "*kwispel*", "wandelen??"],
+            Pool::Soft => &["voorzichtig nu!", "boven de 80%!", "dat is best veel!"],
+            Pool::Urgent => &["oei oei!!", "bijna op!!", "boven 90%! pas op!!"],
+            Pool::Rest => &["goed gedaan vandaag!!", "het is gelukt!!", "zo trots!!"],
+            Pool::Encourage => &["gaat goed!!", "ga zo door!!", "jij kan dit!!"],
+        }
+    }
+}
+
+fn es_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
+    if is_cat {
+        match pool {
+            Pool::Hover => &[
+                "...qué quieres.",
+                "ah, eres tú.",
+                "¿me estás mirando?",
+                "¿sí?",
+                "...vale, mira.",
+            ],
+            Pool::Click => &[
+                "¿en serio?",
+                "...bah.",
+                "¿otra vez? como quieras.",
+                "¿te importa?",
+                "está bien, supongo.",
+            ],
+            Pool::Idle => &["zzz...", "qué aburrimiento.", "...", "*estira*"],
+            Pool::Soft => &["¿bajas el ritmo?", "más del 80%, ¿eh?", "eso es mucho..."],
+            Pool::Urgent => &["esto va mal.", "casi al límite.", "más del 90%. no es mi problema."],
+            Pool::Rest => &["...buen trabajo.", "no está mal, supongo.", "ve a descansar."],
+            Pool::Encourage => &["vas bien.", "queda de sobra.", "bah, no está mal."],
+        }
+    } else {
+        match pool {
+            Pool::Hover => &[
+                "¡¡HOLA HOLA!! 🐾",
+                "¿¿jugamos??",
+                "¡¡mírame!!",
+                "¡ay qué emoción!",
+                "¡¡por aquí!!",
+            ],
+            Pool::Click => &[
+                "¡¡SÍSÍSÍ!!",
+                "¡¡otra vez!! 🐾",
+                "¡¡el mejor día!!",
+                "¡¡acaríciame más!!",
+                "¡¡yupi!!",
+            ],
+            Pool::Idle => &["qué aburrido guau", "¡a jugar!", "*mueve la cola*", "¿¿paseo??"],
+            Pool::Soft => &["¡cuidado ya!", "¡más del 80%!", "¡eso es bastante!"],
+            Pool::Urgent => &["¡¡ay no!!", "¡¡casi al límite!!", "¡¡más del 90%! ¡cuidado!!"],
+            Pool::Rest => &["¡¡buen trabajo hoy!!", "¡¡lo lograste!!", "¡¡qué orgullo!!"],
+            Pool::Encourage => &["¡¡vas genial!!", "¡¡sigue así!!", "¡¡tú puedes!!"],
+        }
+    }
+}
+
+fn fr_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
+    if is_cat {
+        match pool {
+            Pool::Hover => &[
+                "...qu'est-ce que tu veux.",
+                "ah, c'est toi.",
+                "tu me fixes ?",
+                "ouais ?",
+                "...bon, regarde.",
+            ],
+            Pool::Click => &[
+                "il le faut vraiment.",
+                "...pff.",
+                "encore ? si tu veux.",
+                "ça te dérange ?",
+                "bon, d'accord.",
+            ],
+            Pool::Idle => &["zzz...", "tellement ennuyeux.", "...", "*s'étire*"],
+            Pool::Soft => &["tu ralentis ?", "plus de 80%, tu sais.", "ça fait beaucoup..."],
+            Pool::Urgent => &["c'est mauvais.", "presque au max.", "plus de 90%. pas mon problème."],
+            Pool::Rest => &["...bien joué.", "pas mal, j'imagine.", "va te reposer."],
+            Pool::Encourage => &["ça roule.", "il reste de la marge.", "pff, pas mal."],
+        }
+    } else {
+        match pool {
+            Pool::Hover => &[
+                "COUCOU COUCOU !! 🐾",
+                "on joue ?? on joue ??",
+                "regarde-moi !!",
+                "oh là là !",
+                "par ici !!",
+            ],
+            Pool::Click => &[
+                "OUIOUIOUI !!",
+                "encore encore !! 🐾",
+                "meilleur jour !!",
+                "caresse-moi encore !!",
+                "youpi !!",
+            ],
+            Pool::Idle => &["trop ennuyeux ouaf", "on joue !", "*remue la queue*", "promenade ??"],
+            Pool::Soft => &["attention !", "plus de 80% !", "ça fait pas mal !"],
+            Pool::Urgent => &["oh oh !!", "presque au max !!", "plus de 90% ! attention !!"],
+            Pool::Rest => &["bravo aujourd'hui !!", "tu as réussi !!", "trop fier !!"],
+            Pool::Encourage => &["ça va super !!", "continue !!", "tu gères !!"],
+        }
+    }
+}
+
+fn ko_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
+    if is_cat {
+        match pool {
+            Pool::Hover => &["...뭐야.", "아, 너구나.", "쳐다보는 거야?", "응?", "...그래, 봐."],
+            Pool::Click => &[
+                "꼭 그래야겠어?",
+                "...흥.",
+                "또? 마음대로 해.",
+                "방해되는데.",
+                "뭐, 좋아.",
+            ],
+            Pool::Idle => &["zzz...", "심심하다냥.", "...", "*기지개*"],
+            Pool::Soft => &["슬슬 줄이지?", "80% 넘었어.", "좀 많은데..."],
+            Pool::Urgent => &["위험하다냥!", "거의 한계야.", "90% 넘음. 난 몰라."],
+            Pool::Rest => &["...수고했어.", "뭐, 나쁘진 않네.", "이제 좀 쉬어."],
+            Pool::Encourage => &["좋은데.", "아직 여유 있잖아.", "흥, 나쁘지 않네."],
+        }
+    } else {
+        match pool {
+            Pool::Hover => &["안녕안녕!! 🐾", "놀자?? 놀자??", "나 좀 봐봐!!", "우와 우와!", "여기야 여기!!"],
+            Pool::Click => &["좋아좋아!!", "한 번 더!! 🐾", "최고의 날!!", "더 쓰다듬어줘!!", "야호!!"],
+            Pool::Idle => &["심심해 멍", "놀자!", "*꼬리 흔들흔들*", "산책 갈까??"],
+            Pool::Soft => &["이제 조심해!", "80% 넘었어!", "좀 많은 것 같아!"],
+            Pool::Urgent => &["큰일이야 멍!", "거의 한계야!", "90%! 조심해!!"],
+            Pool::Rest => &["오늘도 잘했어!!", "해냈어!!", "정말 대단해!!"],
+            Pool::Encourage => &["잘하고 있어!!", "그 기세야!!", "넌 할 수 있어!!"],
+        }
+    }
+}
+
+fn zh_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
+    if is_cat {
+        match pool {
+            Pool::Hover => &["...你想幹嘛。", "喔，是你啊。", "在盯著我看？", "幹嘛？", "...好啦，看吧。"],
+            Pool::Click => &["非要這樣嗎。", "...哼。", "又來？隨便你。", "很煩耶。", "好吧，隨便。"],
+            Pool::Idle => &["zzz...", "好無聊。", "...", "*伸懶腰*"],
+            Pool::Soft => &["差不多該收手了吧？", "超過八成了喔。", "有點多耶..."],
+            Pool::Urgent => &["不妙喔。", "快到上限了。", "超過九成。不關我的事。"],
+            Pool::Rest => &["...辛苦了。", "還不錯啦，我想。", "去休息吧。"],
+            Pool::Encourage => &["還行啊。", "還有餘裕呢。", "哼，不賴嘛。"],
+        }
+    } else {
+        match pool {
+            Pool::Hover => &["嗨嗨嗨!! 🐾", "玩嗎?? 玩嗎??", "看我看我!!", "天啊天啊!", "這邊這邊!!"],
+            Pool::Click => &["好耶好耶!!", "再一次!! 🐾", "最棒的一天!!", "再摸摸我!!", "耶!!"],
+            Pool::Idle => &["好無聊汪", "來玩吧!", "*搖尾巴*", "去散步??"],
+            Pool::Soft => &["小心點囉!", "超過八成了!", "好像有點多!"],
+            Pool::Urgent => &["糟糕!!", "快到上限了!!", "超過九成! 小心!!"],
+            Pool::Rest => &["今天也辛苦了!!", "你做到了!!", "好驕傲!!"],
+            Pool::Encourage => &["表現很好!!", "繼續加油!!", "你可以的!!"],
         }
     }
 }
