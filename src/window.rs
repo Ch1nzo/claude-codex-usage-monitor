@@ -1084,7 +1084,27 @@ fn codex_usage_text_color(is_dark: bool) -> Color {
     }
 }
 
+/// GUI apps (windows subsystem, panic=abort) show no console and no log when
+/// they panic. Record the panic message + location to a crash log so failures
+/// are diagnosable.
+fn install_panic_logger() {
+    std::panic::set_hook(Box::new(|info| {
+        let path = std::env::temp_dir().join("claude-codex-usage-monitor-crash.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "{info}");
+        }
+        diagnose::log(format!("PANIC: {info}"));
+    }));
+}
+
 pub fn run() {
+    install_panic_logger();
+
     // Enable Per-Monitor DPI Awareness V2 for crisp rendering at any scale factor
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -3257,22 +3277,24 @@ fn draw_usage_bar(
         BarTheme::Pixel => draw_bar_pixel(hdc, bar_x, y, bar_w, seg_h, percent, &fill, track),
     }
 
-    unsafe {
-        let text_x = bar_x + bar_w + sc(BAR_RIGHT_MARGIN);
-        let mut text_wide: Vec<u16> = text.encode_utf16().collect();
-        let mut text_rect = RECT {
-            left: text_x,
-            top: y,
-            right: text_x + sc(TEXT_WIDTH),
-            bottom: y + seg_h,
-        };
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-        let _ = DrawTextW(
-            hdc,
-            &mut text_wide,
-            &mut text_rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-        );
+    if !text.is_empty() {
+        unsafe {
+            let text_x = bar_x + bar_w + sc(BAR_RIGHT_MARGIN);
+            let mut text_wide: Vec<u16> = text.encode_utf16().collect();
+            let mut text_rect = RECT {
+                left: text_x,
+                top: y,
+                right: text_x + sc(TEXT_WIDTH),
+                bottom: y + seg_h,
+            };
+            let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+            let _ = DrawTextW(
+                hdc,
+                &mut text_wide,
+                &mut text_rect,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+        }
     }
 }
 
