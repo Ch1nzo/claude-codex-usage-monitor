@@ -176,6 +176,12 @@ pub struct Strings {
     pub show_labels: &'static str,
     pub show_percentages: &'static str,
     pub show_reset_timer: &'static str,
+    pub cat_color: &'static str,
+    pub dog_color: &'static str,
+    pub color_orange: &'static str,
+    pub color_grey: &'static str,
+    pub color_brown: &'static str,
+    pub color_black: &'static str,
 }
 
 pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {

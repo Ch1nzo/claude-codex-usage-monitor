@@ -279,12 +279,21 @@ fn set_bubble(critter: &mut Critter, text: String, ttl: u32, pri: u8) {
 
 /// Create (once) and show the character window. Safe to call again to refresh
 /// the enabled state / kind / language / anchor.
-pub fn init(anchor: RECT, enabled: bool, kind: CharacterKind, lang: LanguageId) {
+pub fn init(
+    anchor: RECT,
+    enabled: bool,
+    kind: CharacterKind,
+    cat_variant: u8,
+    dog_variant: u8,
+    lang: LanguageId,
+) {
     {
         let guard = STATE.lock().unwrap();
         if guard.is_some() {
             drop(guard);
             set_kind(kind);
+            set_variant(true, cat_variant);
+            set_variant(false, dog_variant);
             set_language(lang);
             set_enabled(enabled);
             reposition(anchor);
@@ -334,8 +343,8 @@ pub fn init(anchor: RECT, enabled: bool, kind: CharacterKind, lang: LanguageId) 
         win_w,
         win_h,
         frame: 0,
-        cat: Critter::new(true, 0, 8.0, 1.0),
-        dog: Critter::new(false, 0, max_x - 8.0, -1.0),
+        cat: Critter::new(true, cat_variant & 1, 8.0, 1.0),
+        dog: Critter::new(false, dog_variant & 1, max_x - 8.0, -1.0),
         last_band: Band::Low,
         mood: Band::Low,
         last_idle_frame: 0,
@@ -417,6 +426,46 @@ pub fn set_language(lang: LanguageId) {
     if let Some(s) = guard.as_mut() {
         s.lang = lang;
     }
+}
+
+pub fn set_variant(is_cat: bool, variant: u8) {
+    {
+        let mut guard = STATE.lock().unwrap();
+        let Some(s) = guard.as_mut() else {
+            return;
+        };
+        let v = variant & 1;
+        if is_cat {
+            if s.cat.variant == v {
+                return;
+            }
+            s.cat.variant = v;
+        } else {
+            if s.dog.variant == v {
+                return;
+            }
+            s.dog.variant = v;
+        }
+    }
+    render();
+}
+
+pub fn cat_variant() -> u8 {
+    STATE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.cat.variant)
+        .unwrap_or(0)
+}
+
+pub fn dog_variant() -> u8 {
+    STATE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.dog.variant)
+        .unwrap_or(0)
 }
 
 pub fn is_enabled() -> bool {

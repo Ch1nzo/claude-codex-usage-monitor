@@ -58,4 +58,10 @@ pub(super) const STRINGS: Strings = Strings {
     show_labels: "라벨 표시",
     show_percentages: "퍼센트 표시",
     show_reset_timer: "리셋 타이머 표시",
+    cat_color: "고양이 색상",
+    dog_color: "개 색상",
+    color_orange: "주황색",
+    color_grey: "회색",
+    color_brown: "갈색",
+    color_black: "검정색",
 };

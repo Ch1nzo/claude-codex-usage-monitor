@@ -58,4 +58,10 @@ pub(super) const STRINGS: Strings = Strings {
     show_labels: "Show Labels",
     show_percentages: "Show Percentages",
     show_reset_timer: "Show Reset Timer",
+    cat_color: "Cat Color",
+    dog_color: "Dog Color",
+    color_orange: "Orange",
+    color_grey: "Grey",
+    color_brown: "Brown",
+    color_black: "Black",
 };

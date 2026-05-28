@@ -58,4 +58,10 @@ pub(super) const STRINGS: Strings = Strings {
     show_labels: "顯示標籤",
     show_percentages: "顯示百分比",
     show_reset_timer: "顯示重置計時器",
+    cat_color: "貓的顏色",
+    dog_color: "狗的顏色",
+    color_orange: "橘色",
+    color_grey: "灰色",
+    color_brown: "棕色",
+    color_black: "黑色",
 };

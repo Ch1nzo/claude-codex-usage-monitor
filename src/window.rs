@@ -132,6 +132,10 @@ const IDM_CHAR_SHOW: u16 = 80;
 const IDM_CHAR_CAT: u16 = 81;
 const IDM_CHAR_DOG: u16 = 82;
 const IDM_CHAR_BOTH: u16 = 83;
+const IDM_CAT_COLOR_0: u16 = 84;
+const IDM_CAT_COLOR_1: u16 = 85;
+const IDM_DOG_COLOR_0: u16 = 86;
+const IDM_DOG_COLOR_1: u16 = 87;
 
 const IDM_SEG_4: u16 = 90;
 const IDM_SEG_6: u16 = 91;
@@ -356,6 +360,10 @@ struct SettingsFile {
     characters_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     character_kind: Option<String>,
+    #[serde(default)]
+    cat_variant: u8,
+    #[serde(default)]
+    dog_variant: u8,
     #[serde(default = "default_segment_count")]
     segment_count: u8,
     #[serde(default = "default_true")]
@@ -379,6 +387,8 @@ impl Default for SettingsFile {
             bar_theme: None,
             characters_enabled: true,
             character_kind: None,
+            cat_variant: 0,
+            dog_variant: 0,
             segment_count: 10,
             show_labels: true,
             show_percentages: true,
@@ -453,6 +463,8 @@ fn save_state_settings() {
             bar_theme: Some(current_bar_theme().code().to_string()),
             characters_enabled: character::is_enabled(),
             character_kind: Some(character::current_kind().code().to_string()),
+            cat_variant: character::cat_variant(),
+            dog_variant: character::dog_variant(),
             segment_count: current_segment_count() as u8,
             show_labels: show_labels(),
             show_percentages: show_percentages(),
@@ -1329,7 +1341,14 @@ pub fn run() {
             .and_then(CharacterKind::from_code)
             .unwrap_or(CharacterKind::Cat);
         if let Some(anchor) = native_interop::get_window_rect_safe(hwnd) {
-            character::init(anchor, settings.characters_enabled, character_kind, language);
+            character::init(
+                anchor,
+                settings.characters_enabled,
+                character_kind,
+                settings.cat_variant,
+                settings.dog_variant,
+                language,
+            );
         }
 
         // Poll timer: 15 minutes
@@ -2600,6 +2619,14 @@ unsafe extern "system" fn wnd_proc(
                     character::set_kind(kind);
                     save_state_settings();
                 }
+                IDM_CAT_COLOR_0 | IDM_CAT_COLOR_1 => {
+                    character::set_variant(true, if id == IDM_CAT_COLOR_1 { 1 } else { 0 });
+                    save_state_settings();
+                }
+                IDM_DOG_COLOR_0 | IDM_DOG_COLOR_1 => {
+                    character::set_variant(false, if id == IDM_DOG_COLOR_1 { 1 } else { 0 });
+                    save_state_settings();
+                }
                 IDM_SEG_4 | IDM_SEG_6 | IDM_SEG_8 | IDM_SEG_10 => {
                     let n: u8 = match id {
                         IDM_SEG_4 => 4,
@@ -2854,6 +2881,63 @@ fn show_context_menu(hwnd: HWND) {
                 PCWSTR::from_raw(label_str.as_ptr()),
             );
         }
+
+        // Color variant submenus
+        let _ = AppendMenuW(characters_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let cat_var = character::cat_variant();
+        let cat_color_menu = CreatePopupMenu().unwrap();
+        for (id, v, label) in [
+            (IDM_CAT_COLOR_0, 0u8, strings.color_orange),
+            (IDM_CAT_COLOR_1, 1u8, strings.color_grey),
+        ] {
+            let label_str = native_interop::wide_str(label);
+            let flags = if v == cat_var {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                cat_color_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label_str.as_ptr()),
+            );
+        }
+        let cat_color_label = native_interop::wide_str(strings.cat_color);
+        let _ = AppendMenuW(
+            characters_menu,
+            MF_POPUP,
+            cat_color_menu.0 as usize,
+            PCWSTR::from_raw(cat_color_label.as_ptr()),
+        );
+
+        let dog_var = character::dog_variant();
+        let dog_color_menu = CreatePopupMenu().unwrap();
+        for (id, v, label) in [
+            (IDM_DOG_COLOR_0, 0u8, strings.color_brown),
+            (IDM_DOG_COLOR_1, 1u8, strings.color_black),
+        ] {
+            let label_str = native_interop::wide_str(label);
+            let flags = if v == dog_var {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                dog_color_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label_str.as_ptr()),
+            );
+        }
+        let dog_color_label = native_interop::wide_str(strings.dog_color);
+        let _ = AppendMenuW(
+            characters_menu,
+            MF_POPUP,
+            dog_color_menu.0 as usize,
+            PCWSTR::from_raw(dog_color_label.as_ptr()),
+        );
+
         let characters_label = native_interop::wide_str(strings.characters);
         let _ = AppendMenuW(
             menu,

@@ -58,4 +58,10 @@ pub(super) const STRINGS: Strings = Strings {
     show_labels: "ラベルを表示",
     show_percentages: "パーセントを表示",
     show_reset_timer: "リセットタイマーを表示",
+    cat_color: "猫の色",
+    dog_color: "犬の色",
+    color_orange: "オレンジ",
+    color_grey: "グレー",
+    color_brown: "ブラウン",
+    color_black: "ブラック",
 };
