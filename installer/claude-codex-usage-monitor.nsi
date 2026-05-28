@@ -16,7 +16,12 @@ Unicode true
 !define PUBLISHER "PIARY Co.Ltd"
 !define VERSION "1.0.0"
 !define EXE_NAME "claude-codex-usage-monitor.exe"
-!define EXE_SOURCE "..\target\x86_64-pc-windows-gnu\release\${EXE_NAME}"
+; EXE_SOURCE can be overridden on the command line, e.g. in CI which uses the
+; MSVC target dir:  makensis /DEXE_SOURCE=..\target\release\<exe> script.nsi
+; The default points at the WSL gnu cross-build output used locally.
+!ifndef EXE_SOURCE
+  !define EXE_SOURCE "..\target\x86_64-pc-windows-gnu\release\${EXE_NAME}"
+!endif
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_ID}"
 !define RUN_KEY "Software\Microsoft\Windows\CurrentVersion\Run"
 

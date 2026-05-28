@@ -10,6 +10,7 @@ permissions:
 
 env:
   RELEASE_ASSET_NAME: claude-codex-usage-monitor.exe
+  INSTALLER_NAME: claude-codex-usage-monitor-setup.exe
 
 jobs:
   build:
@@ -24,8 +25,20 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
+      - name: Install NSIS
+        run: choco install nsis -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\NSIS\makensis.exe" `
+            /DEXE_SOURCE=..\target\release\claude-codex-usage-monitor.exe `
+            installer\claude-codex-usage-monitor.nsi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/${{ env.RELEASE_ASSET_NAME }}
+          files: |
+            installer/${{ env.INSTALLER_NAME }}
+            target/release/${{ env.RELEASE_ASSET_NAME }}
           generate_release_notes: true
