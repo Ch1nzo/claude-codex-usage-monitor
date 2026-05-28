@@ -48,4 +48,9 @@ pub(super) const STRINGS: Strings = Strings {
     bar_theme_flat: "미니멀 플랫",
     bar_theme_gradient: "그라데이션",
     bar_theme_pixel: "레트로 픽셀",
+    characters: "캐릭터",
+    show_characters: "캐릭터 표시",
+    character_cat: "고양이",
+    character_dog: "개",
+    character_both: "둘 다",
 };

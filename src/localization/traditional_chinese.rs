@@ -48,4 +48,9 @@ pub(super) const STRINGS: Strings = Strings {
     bar_theme_flat: "簡約扁平",
     bar_theme_gradient: "漸層光暈",
     bar_theme_pixel: "復古像素",
+    characters: "角色",
+    show_characters: "顯示角色",
+    character_cat: "貓",
+    character_dog: "狗",
+    character_both: "兩者",
 };

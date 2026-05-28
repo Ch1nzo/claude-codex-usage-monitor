@@ -48,4 +48,9 @@ pub(super) const STRINGS: Strings = Strings {
     bar_theme_flat: "Minimalistisch plat",
     bar_theme_gradient: "Kleurovergang",
     bar_theme_pixel: "Retro-pixel",
+    characters: "Personages",
+    show_characters: "Personages tonen",
+    character_cat: "Kat",
+    character_dog: "Hond",
+    character_both: "Beide",
 };

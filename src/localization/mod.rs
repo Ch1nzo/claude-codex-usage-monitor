@@ -166,6 +166,11 @@ pub struct Strings {
     pub bar_theme_flat: &'static str,
     pub bar_theme_gradient: &'static str,
     pub bar_theme_pixel: &'static str,
+    pub characters: &'static str,
+    pub show_characters: &'static str,
+    pub character_cat: &'static str,
+    pub character_dog: &'static str,
+    pub character_both: &'static str,
 }
 
 pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {

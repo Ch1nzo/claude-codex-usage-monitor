@@ -48,4 +48,9 @@ pub(super) const STRINGS: Strings = Strings {
     bar_theme_flat: "ミニマルフラット",
     bar_theme_gradient: "グラデーション",
     bar_theme_pixel: "レトロピクセル",
+    characters: "キャラクター",
+    show_characters: "キャラクターを表示",
+    character_cat: "猫",
+    character_dog: "犬",
+    character_both: "両方",
 };

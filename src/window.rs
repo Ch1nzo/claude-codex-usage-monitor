@@ -16,6 +16,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::character::{self, CharacterKind};
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
@@ -126,6 +127,11 @@ const IDM_BAR_THEME_SEGMENTED: u16 = 70;
 const IDM_BAR_THEME_FLAT: u16 = 71;
 const IDM_BAR_THEME_GRADIENT: u16 = 72;
 const IDM_BAR_THEME_PIXEL: u16 = 73;
+
+const IDM_CHAR_SHOW: u16 = 80;
+const IDM_CHAR_CAT: u16 = 81;
+const IDM_CHAR_DOG: u16 = 82;
+const IDM_CHAR_BOTH: u16 = 83;
 
 const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
 
@@ -298,6 +304,10 @@ struct SettingsFile {
     show_codex: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bar_theme: Option<String>,
+    #[serde(default)]
+    characters_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    character_kind: Option<String>,
 }
 
 impl Default for SettingsFile {
@@ -311,6 +321,8 @@ impl Default for SettingsFile {
             show_claude_code: true,
             show_codex: false,
             bar_theme: None,
+            characters_enabled: false,
+            character_kind: None,
         }
     }
 }
@@ -367,6 +379,8 @@ fn save_state_settings() {
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
             bar_theme: Some(current_bar_theme().code().to_string()),
+            characters_enabled: character::is_enabled(),
+            character_kind: Some(character::current_kind().code().to_string()),
         });
     }
 }
@@ -1209,6 +1223,16 @@ pub fn run() {
         // Initial render via UpdateLayeredWindow (for embedded) or InvalidateRect (fallback)
         render_layered();
 
+        // Initialize the pixel character window (floats above the widget).
+        let character_kind = settings
+            .character_kind
+            .as_deref()
+            .and_then(CharacterKind::from_code)
+            .unwrap_or(CharacterKind::Cat);
+        if let Some(anchor) = native_interop::get_window_rect_safe(hwnd) {
+            character::init(anchor, settings.characters_enabled, character_kind, language);
+        }
+
         // Poll timer: 15 minutes
         let initial_poll_ms = {
             let state = lock_state();
@@ -1903,6 +1927,11 @@ fn position_at_taskbar() {
             "positioned fallback widget at x={x} y={y} w={widget_width} h={widget_height}"
         ));
     }
+
+    // Keep the character window anchored above the widget.
+    if let Some(rect) = native_interop::get_window_rect_safe(hwnd) {
+        character::reposition(rect);
+    }
 }
 
 fn compute_anchor_y(anchor_top: i32, anchor_height: i32, widget_height: i32) -> i32 {
@@ -2071,6 +2100,25 @@ unsafe extern "system" fn wnd_proc(
             check_theme_change();
             check_language_change();
             render_layered();
+            {
+                let (max_pct, lang) = {
+                    let state = lock_state();
+                    match state.as_ref() {
+                        Some(s) => {
+                            let mut m = 0.0_f64;
+                            if s.show_claude_code {
+                                m = m.max(s.session_percent).max(s.weekly_percent);
+                            }
+                            if s.show_codex {
+                                m = m.max(s.codex_session_percent).max(s.codex_weekly_percent);
+                            }
+                            (m, s.language)
+                        }
+                        None => (0.0, LanguageId::English),
+                    }
+                };
+                character::on_usage_update(max_pct, lang);
+            }
             schedule_countdown_timer();
             suppress_tray_reposition_for(Duration::from_millis(
                 TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS,
@@ -2389,12 +2437,16 @@ unsafe extern "system" fn wnd_proc(
                         IDM_LANG_TRADITIONAL_CHINESE => Some(LanguageId::TraditionalChinese),
                         _ => None,
                     };
-                    {
+                    let new_language = {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
                             apply_language_to_state(s, language_override);
+                            s.language
+                        } else {
+                            LanguageId::English
                         }
-                    }
+                    };
+                    character::set_language(new_language);
                     save_state_settings();
                     render_layered();
                 }
@@ -2411,6 +2463,22 @@ unsafe extern "system" fn wnd_proc(
                     CURRENT_BAR_THEME.store(theme.to_u8(), Ordering::Relaxed);
                     save_state_settings();
                     render_layered();
+                }
+                IDM_CHAR_SHOW => {
+                    character::set_enabled(!character::is_enabled());
+                    if let Some(anchor) = native_interop::get_window_rect_safe(hwnd) {
+                        character::reposition(anchor);
+                    }
+                    save_state_settings();
+                }
+                IDM_CHAR_CAT | IDM_CHAR_DOG | IDM_CHAR_BOTH => {
+                    let kind = match id {
+                        IDM_CHAR_DOG => CharacterKind::Dog,
+                        IDM_CHAR_BOTH => CharacterKind::Both,
+                        _ => CharacterKind::Cat,
+                    };
+                    character::set_kind(kind);
+                    save_state_settings();
                 }
                 id if id == tray_icon::IDM_TOGGLE_WIDGET => {
                     toggle_widget_visibility(hwnd);
@@ -2439,6 +2507,7 @@ unsafe extern "system" fn wnd_proc(
             if let Some(h) = hook {
                 native_interop::unhook_win_event(h);
             }
+            character::destroy();
             tray_icon::remove_all(hwnd);
             PostQuitMessage(0);
             LRESULT(0)
@@ -2593,6 +2662,49 @@ fn show_context_menu(hwnd: HWND) {
             MF_POPUP,
             bar_style_menu.0 as usize,
             PCWSTR::from_raw(bar_style_label.as_ptr()),
+        );
+
+        // Characters submenu (top-level)
+        let characters_menu = CreatePopupMenu().unwrap();
+        let show_chars_str = native_interop::wide_str(strings.show_characters);
+        let show_chars_flags = if character::is_enabled() {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            characters_menu,
+            show_chars_flags,
+            IDM_CHAR_SHOW as usize,
+            PCWSTR::from_raw(show_chars_str.as_ptr()),
+        );
+        let _ = AppendMenuW(characters_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let current_kind = character::current_kind();
+        let kind_items: [(u16, CharacterKind, &str); 3] = [
+            (IDM_CHAR_CAT, CharacterKind::Cat, strings.character_cat),
+            (IDM_CHAR_DOG, CharacterKind::Dog, strings.character_dog),
+            (IDM_CHAR_BOTH, CharacterKind::Both, strings.character_both),
+        ];
+        for (id, kind, label) in kind_items {
+            let label_str = native_interop::wide_str(label);
+            let flags = if kind == current_kind {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                characters_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label_str.as_ptr()),
+            );
+        }
+        let characters_label = native_interop::wide_str(strings.characters);
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            characters_menu.0 as usize,
+            PCWSTR::from_raw(characters_label.as_ptr()),
         );
 
         // Settings submenu
