@@ -14,7 +14,7 @@ Unicode true
 !define APP_NAME "Claude & Codex Usage Monitor"
 !define APP_ID "ClaudeCodexUsageMonitor"
 !define PUBLISHER "PIARY Co.Ltd"
-!define VERSION "1.4.1"
+!define VERSION "1.0.0"
 !define EXE_NAME "claude-codex-usage-monitor.exe"
 !define EXE_SOURCE "..\target\x86_64-pc-windows-gnu\release\${EXE_NAME}"
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_ID}"
