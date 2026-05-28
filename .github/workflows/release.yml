@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_ASSET_NAME: claude-codex-usage-monitor.exe
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Rename binary to release asset name
+        shell: pwsh
+        run: |
+          Copy-Item target/release/claude-codex-usage-monitor.exe "target/release/${{ env.RELEASE_ASSET_NAME }}" -Force
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/${{ env.RELEASE_ASSET_NAME }}
+          generate_release_notes: true
