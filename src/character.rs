@@ -20,6 +20,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -213,7 +214,9 @@ struct CharState {
     cat: Critter,
     dog: Critter,
     last_band: Band,
+    mood: Band,
     last_idle_frame: u64,
+    last_pred_frame: u64,
     tracking_leave: bool,
 }
 
@@ -334,7 +337,9 @@ pub fn init(anchor: RECT, enabled: bool, kind: CharacterKind, lang: LanguageId) 
         cat: Critter::new(true, 0, 8.0, 1.0),
         dog: Critter::new(false, 0, max_x - 8.0, -1.0),
         last_band: Band::Low,
+        mood: Band::Low,
         last_idle_frame: 0,
+        last_pred_frame: 0,
         tracking_leave: false,
     };
     *STATE.lock().unwrap() = Some(state);
@@ -448,8 +453,15 @@ pub fn reposition(anchor: RECT) {
     }
 }
 
-/// Drive threshold-based messages from the latest usage percentage.
-pub fn on_usage_update(max_percent: f64, lang: LanguageId) {
+/// Drive mood, threshold messages, and burn-rate predictions from the latest
+/// usage. `session_percent` / `session_resets_at` describe the 5h window used
+/// for the pace projection; `max_percent` drives the warning bands.
+pub fn on_usage_update(
+    max_percent: f64,
+    session_percent: f64,
+    session_resets_at: Option<SystemTime>,
+    lang: LanguageId,
+) {
     let mut guard = STATE.lock().unwrap();
     let Some(s) = guard.as_mut() else {
         return;
@@ -460,6 +472,8 @@ pub fn on_usage_update(max_percent: f64, lang: LanguageId) {
     }
 
     let band = band_for(max_percent);
+    s.mood = band; // persistent facial expression
+
     let (pool, do_react) = match (s.last_band, band) {
         (prev, Band::Urgent) if prev != Band::Urgent => (Some(Pool::Urgent), true),
         (Band::Low, Band::Soft) => (Some(Pool::Soft), true),
@@ -479,7 +493,6 @@ pub fn on_usage_update(max_percent: f64, lang: LanguageId) {
     if let Some(pool) = pool {
         let lang = s.lang;
         let kind = s.kind;
-        // Show on whichever characters are visible.
         if kind.shows_cat() {
             let text = pick_message(&mut s.cat, lang, pool);
             set_bubble(&mut s.cat, text, THRESHOLD_BUBBLE_TICKS, PRI_THRESHOLD);
@@ -494,6 +507,72 @@ pub fn on_usage_update(max_percent: f64, lang: LanguageId) {
                 s.dog.react_ticks = 12;
             }
         }
+        return; // don't also fire a prediction this update
+    }
+
+    // Burn-rate prediction: if at the current pace we'll hit 100% before the
+    // 5h window resets, occasionally warn with the projected clock time.
+    if session_percent >= 25.0 && session_percent < 95.0 {
+        if let Some(reset) = session_resets_at {
+            let now = SystemTime::now();
+            if let (Some(secs_to_full), Ok(to_reset)) =
+                (secs_until_full(session_percent, reset), reset.duration_since(now))
+            {
+                let secs_to_reset = to_reset.as_secs() as f64;
+                if secs_to_full < secs_to_reset
+                    && s.frame.saturating_sub(s.last_pred_frame) >= PRED_COOLDOWN
+                {
+                    s.last_pred_frame = s.frame;
+                    let hhmm = local_hhmm_after(secs_to_full as u64);
+                    let lang = s.lang;
+                    let kind = s.kind;
+                    if kind.shows_cat() {
+                        let text = prediction_message(lang, true, &hhmm);
+                        set_bubble(&mut s.cat, text, THRESHOLD_BUBBLE_TICKS, PRI_CLICK);
+                    }
+                    if kind.shows_dog() {
+                        let text = prediction_message(lang, false, &hhmm);
+                        set_bubble(&mut s.dog, text, THRESHOLD_BUBBLE_TICKS, PRI_CLICK);
+                    }
+                }
+            }
+        }
+    }
+}
+
+const WINDOW_5H_SECS: f64 = 5.0 * 3600.0;
+const PRED_COOLDOWN: u64 = 1800; // ~2.4 min at 80ms/tick
+
+/// Seconds until the 5h window would reach 100% at the current consumption
+/// pace, or None if it can't be estimated yet.
+fn secs_until_full(session_percent: f64, reset: SystemTime) -> Option<f64> {
+    let now = SystemTime::now();
+    let to_reset = reset.duration_since(now).ok()?.as_secs() as f64;
+    let elapsed = WINDOW_5H_SECS - to_reset;
+    if elapsed < 60.0 || session_percent <= 0.0 {
+        return None;
+    }
+    let rate = session_percent / elapsed; // percent per second
+    if rate <= 0.0 {
+        return None;
+    }
+    Some((100.0 - session_percent) / rate)
+}
+
+/// Local wall-clock "HH:MM" `secs` from now (wraps within a day).
+fn local_hhmm_after(secs: u64) -> String {
+    let st = unsafe { GetLocalTime() };
+    let sod = st.wHour as u64 * 3600 + st.wMinute as u64 * 60 + st.wSecond as u64;
+    let proj = (sod + secs) % 86_400;
+    format!("{:02}:{:02}", proj / 3600, (proj % 3600) / 60)
+}
+
+fn prediction_message(lang: LanguageId, is_cat: bool, hhmm: &str) -> String {
+    match (lang, is_cat) {
+        (LanguageId::Japanese, true) => format!("このペースだと{hhmm}に上限かも…"),
+        (LanguageId::Japanese, false) => format!("このままだと{hhmm}で限界だワン！"),
+        (_, true) => format!("at this pace... done by {hhmm}."),
+        (_, false) => format!("uh oh, 100% by {hhmm}!!"),
     }
 }
 
@@ -1014,6 +1093,7 @@ fn draw_character(
     u: i32,
     mirror: bool,
     anim: &Anim,
+    mood: Band,
 ) {
     for (lx, ly, lw, lh, part, tag) in character_blocks(is_cat) {
         if anim.blink && tag == Tag::Eyes {
@@ -1057,6 +1137,37 @@ fn draw_character(
     }
 
     let _ = anim.squash; // reserved for future squash/stretch tuning
+
+    // Mood overlays on top of the face.
+    let dy = anim.body_dy;
+    match mood {
+        Band::Soft => {
+            // worried sweat drop near the top of the head
+            let drop = bgra(150, 205, 240);
+            let dx = if is_cat { 24 } else { 23 };
+            let ax = if mirror { SPRITE - dx - 1 } else { dx };
+            fill_block(bits, w, h, ox + ax * u, oy + (6 + dy) * u, u, 2 * u, drop);
+        }
+        Band::Urgent => {
+            // open mouth + raised "shock" brows
+            let mouth = palette(is_cat, variant, Part::Mouth);
+            let white = bgra(255, 255, 255);
+            if is_cat {
+                fill_block(bits, w, h, ox + 14 * u, oy + (15 + dy) * u, 4 * u, 3 * u, mouth);
+                for ex in [11, 19] {
+                    let ax = if mirror { SPRITE - ex - 3 } else { ex };
+                    fill_block(bits, w, h, ox + ax * u, oy + (7 + dy) * u, 3 * u, u, white);
+                }
+            } else {
+                fill_block(bits, w, h, ox + 14 * u, oy + (17 + dy) * u, 5 * u, 2 * u, mouth);
+                for ex in [12, 18] {
+                    let ax = if mirror { SPRITE - ex - 3 } else { ex };
+                    fill_block(bits, w, h, ox + ax * u, oy + (6 + dy) * u, 3 * u, u, white);
+                }
+            }
+        }
+        Band::Low => {}
+    }
 }
 
 fn render() {
@@ -1084,8 +1195,8 @@ fn render() {
             s.uscale,
             s.kind,
             s.frame,
-            snapshot(&s.cat),
-            snapshot(&s.dog),
+            snapshot(&s.cat, s.mood),
+            snapshot(&s.dog, s.mood),
         )
     };
 
@@ -1121,8 +1232,20 @@ fn render() {
         }
 
         let base_oy = BASE_OY * u;
+        // Panic mood adds a small horizontal shake.
+        let shake = |mood: Band| -> i32 {
+            if mood == Band::Urgent {
+                if frame % 2 == 0 {
+                    u
+                } else {
+                    -u
+                }
+            } else {
+                0
+            }
+        };
         if kind.shows_cat() {
-            let ox = (cat_snapshot.x * u as f32) as i32;
+            let ox = (cat_snapshot.x * u as f32) as i32 + shake(cat_snapshot.mood);
             let anim = anim_for(cat_snapshot.pose, frame, cat_snapshot.blink_ctr);
             draw_character(
                 bits,
@@ -1135,10 +1258,11 @@ fn render() {
                 u,
                 cat_snapshot.dir < 0.0,
                 &anim,
+                cat_snapshot.mood,
             );
         }
         if kind.shows_dog() {
-            let ox = (dog_snapshot.x * u as f32) as i32;
+            let ox = (dog_snapshot.x * u as f32) as i32 + shake(dog_snapshot.mood);
             let anim = anim_for(dog_snapshot.pose, frame, dog_snapshot.blink_ctr);
             draw_character(
                 bits,
@@ -1151,6 +1275,7 @@ fn render() {
                 u,
                 dog_snapshot.dir < 0.0,
                 &anim,
+                dog_snapshot.mood,
             );
         }
 
@@ -1226,6 +1351,7 @@ struct Snapshot {
     pose: Pose,
     variant: u8,
     blink_ctr: u32,
+    mood: Band,
     bubble: Option<BubbleSnap>,
 }
 
@@ -1235,13 +1361,14 @@ struct BubbleSnap {
     max_ttl: u32,
 }
 
-fn snapshot(c: &Critter) -> Snapshot {
+fn snapshot(c: &Critter, mood: Band) -> Snapshot {
     Snapshot {
         x: c.x,
         dir: c.dir,
         pose: c.pose,
         variant: c.variant,
         blink_ctr: c.blink_ctr,
+        mood,
         bubble: c.bubble.as_ref().map(|b| BubbleSnap {
             text: b.text.clone(),
             ttl: b.ttl,

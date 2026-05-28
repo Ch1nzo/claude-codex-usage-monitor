@@ -2105,23 +2105,44 @@ unsafe extern "system" fn wnd_proc(
             check_language_change();
             render_layered();
             {
-                let (max_pct, lang) = {
+                let (max_pct, sess_pct, sess_reset, lang) = {
                     let state = lock_state();
                     match state.as_ref() {
                         Some(s) => {
                             let mut m = 0.0_f64;
+                            // Track the 5h (session) usage + reset of the most-used
+                            // enabled model for the burn-rate prediction.
+                            let mut best_sess = -1.0_f64;
+                            let mut best_reset = None;
                             if s.show_claude_code {
                                 m = m.max(s.session_percent).max(s.weekly_percent);
+                                if s.session_percent > best_sess {
+                                    best_sess = s.session_percent;
+                                    best_reset = s
+                                        .data
+                                        .as_ref()
+                                        .and_then(|d| d.claude_code.as_ref())
+                                        .and_then(|u| u.session.resets_at);
+                                }
                             }
                             if s.show_codex {
                                 m = m.max(s.codex_session_percent).max(s.codex_weekly_percent);
+                                if s.codex_session_percent > best_sess {
+                                    best_sess = s.codex_session_percent;
+                                    best_reset = s
+                                        .data
+                                        .as_ref()
+                                        .and_then(|d| d.codex.as_ref())
+                                        .and_then(|u| u.session.resets_at);
+                                }
                             }
-                            (m, s.language)
+                            let sess = best_sess.max(0.0);
+                            (m, sess, best_reset, s.language)
                         }
-                        None => (0.0, LanguageId::English),
+                        None => (0.0, 0.0, None, LanguageId::English),
                     }
                 };
-                character::on_usage_update(max_pct, lang);
+                character::on_usage_update(max_pct, sess_pct, sess_reset, lang);
             }
             schedule_countdown_timer();
             suppress_tray_reposition_for(Duration::from_millis(
