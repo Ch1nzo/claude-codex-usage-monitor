@@ -197,12 +197,12 @@ impl BarTheme {
         }
     }
 
-    fn label(self) -> &'static str {
+    fn label(self, strings: Strings) -> &'static str {
         match self {
-            BarTheme::Segmented => "Segmented blocks",
-            BarTheme::Flat => "Minimal flat",
-            BarTheme::Gradient => "Gradient glow",
-            BarTheme::Pixel => "Retro pixel",
+            BarTheme::Segmented => strings.bar_theme_segmented,
+            BarTheme::Flat => strings.bar_theme_flat,
+            BarTheme::Gradient => strings.bar_theme_gradient,
+            BarTheme::Pixel => strings.bar_theme_pixel,
         }
     }
 
@@ -2564,6 +2564,37 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(models_label.as_ptr()),
         );
 
+        // Bar Style submenu (top-level)
+        let bar_style_menu = CreatePopupMenu().unwrap();
+        let current_theme = current_bar_theme();
+        for theme in BarTheme::ALL {
+            let id = match theme {
+                BarTheme::Segmented => IDM_BAR_THEME_SEGMENTED,
+                BarTheme::Flat => IDM_BAR_THEME_FLAT,
+                BarTheme::Gradient => IDM_BAR_THEME_GRADIENT,
+                BarTheme::Pixel => IDM_BAR_THEME_PIXEL,
+            };
+            let label_str = native_interop::wide_str(theme.label(strings));
+            let flags = if theme == current_theme {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                bar_style_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label_str.as_ptr()),
+            );
+        }
+        let bar_style_label = native_interop::wide_str(strings.bar_style);
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            bar_style_menu.0 as usize,
+            PCWSTR::from_raw(bar_style_label.as_ptr()),
+        );
+
         // Settings submenu
         let settings_menu = CreatePopupMenu().unwrap();
 
@@ -2633,37 +2664,6 @@ fn show_context_menu(hwnd: HWND) {
             MF_POPUP,
             language_menu.0 as usize,
             PCWSTR::from_raw(language_label.as_ptr()),
-        );
-
-        // Bar Style submenu
-        let bar_style_menu = CreatePopupMenu().unwrap();
-        let current_theme = current_bar_theme();
-        for theme in BarTheme::ALL {
-            let id = match theme {
-                BarTheme::Segmented => IDM_BAR_THEME_SEGMENTED,
-                BarTheme::Flat => IDM_BAR_THEME_FLAT,
-                BarTheme::Gradient => IDM_BAR_THEME_GRADIENT,
-                BarTheme::Pixel => IDM_BAR_THEME_PIXEL,
-            };
-            let label_str = native_interop::wide_str(theme.label());
-            let flags = if theme == current_theme {
-                MF_CHECKED
-            } else {
-                MENU_ITEM_FLAGS(0)
-            };
-            let _ = AppendMenuW(
-                bar_style_menu,
-                flags,
-                id as usize,
-                PCWSTR::from_raw(label_str.as_ptr()),
-            );
-        }
-        let bar_style_label = native_interop::wide_str("Bar Style");
-        let _ = AppendMenuW(
-            settings_menu,
-            MF_POPUP,
-            bar_style_menu.0 as usize,
-            PCWSTR::from_raw(bar_style_label.as_ptr()),
         );
 
         let _ = AppendMenuW(settings_menu, MF_SEPARATOR, 0, PCWSTR::null());

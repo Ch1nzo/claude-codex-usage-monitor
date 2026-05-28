@@ -43,4 +43,9 @@ pub(super) const STRINGS: Strings = Strings {
     codex_token_expired_body: "ターミナルで 'codex' を実行し、サインインの案内に従ってください。その後、このアプリを更新または再起動してください。",
     codex_window_title: "Codex 使用量モニター",
     second_suffix: "秒",
+    bar_style: "バーのスタイル",
+    bar_theme_segmented: "セグメントブロック",
+    bar_theme_flat: "ミニマルフラット",
+    bar_theme_gradient: "グラデーション",
+    bar_theme_pixel: "レトロピクセル",
 };

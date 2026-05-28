@@ -161,6 +161,11 @@ pub struct Strings {
     pub codex_token_expired_title: &'static str,
     pub codex_token_expired_body: &'static str,
     pub codex_window_title: &'static str,
+    pub bar_style: &'static str,
+    pub bar_theme_segmented: &'static str,
+    pub bar_theme_flat: &'static str,
+    pub bar_theme_gradient: &'static str,
+    pub bar_theme_pixel: &'static str,
 }
 
 pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {
