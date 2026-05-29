@@ -1398,102 +1398,143 @@ fn draw_girl(
         fill_block(bits, w, h, ox + ax * u, oy + yy * u, bw * u, bh * u, color);
     };
 
-    // Hair behind the head + twin tails.
-    place(bits, 7, 3, 18, 15, hair, true);
+    // Roughly 4-head proportions so the body (not a chibi head) is the focus.
+    // Vertical layout on the 32 grid:
+    //   head  3..11, neck 11..12, bust 12..17, waist 17..19,
+    //   hips 19..23, thighs 23..27, calves 27..31.
+    let leg_sh = bgra(214, 172, 148);
+
+    // Hair behind the head + long twin tails down the sides.
     let tail = anim.tail_dy;
-    let ax_l = if mirror { SPRITE - 4 - 3 } else { 4 };
-    let ax_r = if mirror { SPRITE - 25 - 3 } else { 25 };
-    fill_block(bits, w, h, ox + ax_l * u, oy + (8 + dy + tail) * u, 3 * u, 9 * u, hair);
-    fill_block(bits, w, h, ox + ax_r * u, oy + (8 + dy + tail) * u, 3 * u, 9 * u, hair);
+    place(bits, 10, 2, 12, 11, hair, true);
+    for tx in [7, 23] {
+        let ax = if mirror { SPRITE - tx - 2 } else { tx };
+        fill_block(bits, w, h, ox + ax * u, oy + (5 + dy + tail) * u, 2 * u, 13 * u, hair);
+    }
+    // Tail ties (small accent near the top of each tail).
+    place(bits, 7, 6, 2, 1, bikini, true);
+    place(bits, 23, 6, 2, 1, bikini, true);
 
-    // Head.
-    place(bits, 9, 5, 14, 12, skin, true);
-    place(bits, 11, 15, 10, 2, skin_sh, true);
+    // Head (slimmer oval) with a soft jaw shadow.
+    place(bits, 11, 3, 10, 8, skin, true);
+    place(bits, 12, 10, 8, 1, skin_sh, true);
 
-    // Neck, torso, arms (skin).
-    place(bits, 14, 16, 4, 2, skin, true);
-    place(bits, 11, 18, 10, 8, skin, true);
-    place(bits, 8, 18, 3, 7, skin, true);
-    place(bits, 21, 18, 3, 7, skin, true);
+    // Neck.
+    place(bits, 14, 11, 4, 2, skin, true);
+    place(bits, 14, 12, 4, 1, skin_sh, true);
 
-    // Legs (planted; animate with the walk offsets).
+    // ---- Bare body (drawn first; clothing layers over it) ----
+    // Shoulders.
+    place(bits, 11, 13, 10, 1, skin, true);
+    // Bust: widest at the chest, with an under-bust shadow for roundness.
+    place(bits, 10, 14, 12, 3, skin, true);
+    place(bits, 10, 16, 12, 1, skin_sh, true);
+    // Cinched waist.
+    place(bits, 12, 17, 8, 2, skin, true);
+    // Hips: flare back out below the waist.
+    place(bits, 10, 19, 12, 4, skin, true);
+    place(bits, 10, 21, 1, 2, skin_sh, true); // side contour shading
+    place(bits, 21, 21, 1, 2, skin_sh, true);
+    // Slim arms along the sides.
+    place(bits, 8, 14, 2, 7, skin, true);
+    place(bits, 22, 14, 2, 7, skin, true);
+    place(bits, 8, 18, 2, 3, skin_sh, true);
+    place(bits, 22, 18, 2, 3, skin_sh, true);
+
+    // Legs (planted; animate with the walk offsets) — thighs taper to calves.
     let lb = 12 + anim.leg_back_dx;
     let lf = 17 + anim.leg_front_dx;
     let axb = if mirror { SPRITE - lb - 3 } else { lb };
     let axf = if mirror { SPRITE - lf - 3 } else { lf };
-    fill_block(bits, w, h, ox + axb * u, oy + 26 * u, 3 * u, 5 * u, skin);
-    fill_block(bits, w, h, ox + axf * u, oy + 26 * u, 3 * u, 5 * u, skin);
+    // thighs (3 wide)
+    fill_block(bits, w, h, ox + axb * u, oy + 23 * u, 3 * u, 4 * u, skin);
+    fill_block(bits, w, h, ox + axf * u, oy + 23 * u, 3 * u, 4 * u, skin);
+    // calves (2 wide, inset) + foot shade
+    fill_block(bits, w, h, ox + (axb + 1) * u, oy + 27 * u, 2 * u, 4 * u, skin);
+    fill_block(bits, w, h, ox + (axf + 1) * u, oy + 27 * u, 2 * u, 4 * u, skin);
+    fill_block(bits, w, h, ox + axb * u, oy + 30 * u, 3 * u, u, leg_sh);
+    fill_block(bits, w, h, ox + axf * u, oy + 30 * u, 3 * u, u, leg_sh);
 
-    // Bottom layer: skirt while dressed, bikini bottom at the top stage.
+    // ---- Clothing layers ----
+    // Bottom layer: flared skirt while dressed, bikini bottom at the top stage.
     if stage <= 2 {
-        place(bits, 10, 24, 12, 5, skirt, true);
-        place(bits, 10, 27, 12, 2, skirt_sh, true);
+        place(bits, 9, 19, 14, 4, skirt, true);
+        place(bits, 9, 22, 14, 1, skirt_sh, true);
     } else {
-        place(bits, 12, 24, 8, 3, bikini, true);
-        place(bits, 12, 24, 8, 1, bikini_tr, true);
+        // Hip-hugging bikini bottom with side ties. Starts at y19 (the top of
+        // the hips) so no bare strip shows above the waistband when there is no
+        // skirt to back it up.
+        place(bits, 10, 19, 12, 4, bikini, true);
+        place(bits, 10, 19, 12, 1, bikini_tr, true);
+        place(bits, 9, 19, 1, 2, bikini_tr, true);
+        place(bits, 22, 19, 1, 2, bikini_tr, true);
     }
     // Top layer: shirt, then bikini top as the shirt comes off.
     if stage <= 1 {
-        place(bits, 11, 17, 10, 8, shirt, true);
-        place(bits, 11, 23, 10, 2, shirt_sh, true);
-        place(bits, 8, 18, 3, 4, shirt, true);
-        place(bits, 21, 18, 3, 4, shirt, true);
+        place(bits, 10, 13, 12, 6, shirt, true);
+        place(bits, 10, 16, 12, 1, shirt_sh, true);
+        place(bits, 8, 14, 2, 4, shirt, true);
+        place(bits, 22, 14, 2, 4, shirt, true);
     } else {
-        place(bits, 11, 18, 10, 3, bikini, true);
-        place(bits, 11, 20, 10, 1, bikini_tr, true);
-        place(bits, 12, 17, 1, 2, bikini_tr, true);
-        place(bits, 19, 17, 1, 2, bikini_tr, true);
+        // Triangle bikini top hugging the bustline + neck/shoulder straps. The
+        // cup spans y14-16 so it covers the bare under-bust shadow at y16 (else
+        // the cup edge reads as ending too high above the midriff).
+        place(bits, 10, 14, 12, 3, bikini, true);
+        place(bits, 10, 16, 12, 1, bikini_tr, true);
+        place(bits, 14, 14, 4, 1, bikini_tr, true); // cleavage notch
+        place(bits, 11, 13, 1, 1, bikini_tr, true); // straps
+        place(bits, 20, 13, 1, 1, bikini_tr, true);
     }
-    // Jacket: only at the fully-dressed stage.
+    // Jacket: only at the fully-dressed stage (open over the shirt).
     if stage == 0 {
-        place(bits, 8, 17, 3, 9, jacket, true);
-        place(bits, 21, 17, 3, 9, jacket, true);
-        place(bits, 10, 17, 12, 2, jacket, true);
+        place(bits, 8, 13, 2, 9, jacket, true);
+        place(bits, 22, 13, 2, 9, jacket, true);
+        place(bits, 10, 13, 12, 1, jacket, true);
     }
 
-    // Hair front (bangs + side locks) over the forehead.
-    place(bits, 9, 4, 14, 4, hair, true);
-    place(bits, 10, 4, 5, 2, hair_hi, true);
-    place(bits, 7, 6, 2, 10, hair, true);
-    place(bits, 23, 6, 2, 10, hair, true);
+    // Hair front (bangs + side locks) over the forehead. Highlight centered on
+    // the sprite axis (x15.5) so it isn't biased to one side.
+    place(bits, 11, 3, 10, 3, hair, true);
+    place(bits, 14, 3, 4, 2, hair_hi, true);
+    place(bits, 9, 5, 2, 8, hair, true);
+    place(bits, 21, 5, 2, 8, hair, true);
 
-    // Face. When blowing a kiss she closes her eyes happily and puckers her
-    // lips; otherwise normal eyes (closed only on a blink).
+    // Face. Eyes around y=6-8, mouth at y=9 on the slimmer head.
     let lips = bgra(228, 72, 96);
     if kissing {
         // Happy closed "^ ^" eyes.
-        place(bits, 11, 11, 3, 1, eye, true);
-        place(bits, 12, 12, 1, 1, eye, true);
-        place(bits, 18, 11, 3, 1, eye, true);
-        place(bits, 19, 12, 1, 1, eye, true);
+        place(bits, 12, 7, 3, 1, eye, true);
+        place(bits, 13, 8, 1, 1, eye, true);
+        place(bits, 17, 7, 3, 1, eye, true);
+        place(bits, 18, 8, 1, 1, eye, true);
     } else if anim.blink {
-        place(bits, 11, 12, 3, 1, skin_sh, true);
-        place(bits, 18, 12, 3, 1, skin_sh, true);
+        place(bits, 12, 8, 3, 1, skin_sh, true);
+        place(bits, 17, 8, 3, 1, skin_sh, true);
     } else {
-        place(bits, 11, 10, 3, 4, eye, true);
-        place(bits, 18, 10, 3, 4, eye, true);
-        place(bits, 12, 10, 1, 1, white, true);
-        place(bits, 19, 10, 1, 1, white, true);
+        place(bits, 12, 6, 3, 3, eye, true);
+        place(bits, 17, 6, 3, 3, eye, true);
+        place(bits, 13, 6, 1, 1, white, true);
+        place(bits, 18, 6, 1, 1, white, true);
     }
-    place(bits, 10, 13, 2, 2, blush, true);
-    place(bits, 20, 13, 2, 2, blush, true);
+    place(bits, 11, 8, 2, 1, blush, true);
+    place(bits, 19, 8, 2, 1, blush, true);
 
     if kissing {
         // Stronger blush + a small puckered mouth.
-        place(bits, 9, 13, 2, 2, blush, true);
-        place(bits, 21, 13, 2, 2, blush, true);
-        place(bits, 15, 14, 2, 2, lips, true);
-        place(bits, 15, 15, 2, 1, bgra(196, 56, 80), true);
+        place(bits, 10, 8, 2, 2, blush, true);
+        place(bits, 20, 8, 2, 2, blush, true);
+        place(bits, 15, 9, 2, 2, lips, true);
+        place(bits, 15, 10, 2, 1, bgra(196, 56, 80), true);
     } else {
-        place(bits, 15, 14, 2, 1, mouth, true);
+        place(bits, 15, 9, 2, 1, mouth, true);
         match mood {
             Band::Soft => {
-                place(bits, 23, 6, 1, 2, bgra(150, 205, 240), true);
+                place(bits, 21, 4, 1, 2, bgra(150, 205, 240), true);
             }
             Band::Urgent => {
-                place(bits, 9, 13, 3, 2, blush, true);
-                place(bits, 19, 13, 3, 2, blush, true);
-                place(bits, 15, 14, 2, 2, mouth, true);
+                place(bits, 10, 8, 2, 2, blush, true);
+                place(bits, 20, 8, 2, 2, blush, true);
+                place(bits, 15, 9, 2, 2, mouth, true);
             }
             Band::Low => {}
         }
@@ -1506,9 +1547,9 @@ fn draw_girl(
         let drift = (elapsed as i32) / 2; // rows risen
         let side = if mirror { -1 } else { 1 };
         let hearts = [
-            (16, 12 - drift, frame % 2 == 0),
-            (19, 14 - drift + 2, (frame / 2) % 2 == 0),
-            (13, 13 - drift + 4, (frame / 3) % 2 == 0),
+            (16, 7 - drift, frame % 2 == 0),
+            (19, 9 - drift + 2, (frame / 2) % 2 == 0),
+            (13, 8 - drift + 4, (frame / 3) % 2 == 0),
         ];
         for (i, (hx, hy, big)) in hearts.iter().enumerate() {
             // Stagger so later hearts only appear after the first has risen.
