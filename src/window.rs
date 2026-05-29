@@ -132,6 +132,7 @@ const IDM_CHAR_SHOW: u16 = 80;
 const IDM_CHAR_CAT: u16 = 81;
 const IDM_CHAR_DOG: u16 = 82;
 const IDM_CHAR_BOTH: u16 = 83;
+const IDM_CHAR_GIRL: u16 = 89;
 const IDM_CAT_COLOR_0: u16 = 84;
 const IDM_CAT_COLOR_1: u16 = 85;
 const IDM_DOG_COLOR_0: u16 = 86;
@@ -2729,9 +2730,10 @@ unsafe extern "system" fn wnd_proc(
                     }
                     save_state_settings();
                 }
-                IDM_CHAR_CAT | IDM_CHAR_DOG | IDM_CHAR_BOTH => {
+                IDM_CHAR_CAT | IDM_CHAR_DOG | IDM_CHAR_GIRL | IDM_CHAR_BOTH => {
                     let kind = match id {
                         IDM_CHAR_DOG => CharacterKind::Dog,
+                        IDM_CHAR_GIRL => CharacterKind::Girl,
                         IDM_CHAR_BOTH => CharacterKind::Both,
                         _ => CharacterKind::Cat,
                     };
@@ -3056,6 +3058,7 @@ fn show_context_menu(hwnd: HWND) {
         for (id, kind, label) in [
             (IDM_CHAR_CAT, CharacterKind::Cat, strings.character_cat),
             (IDM_CHAR_DOG, CharacterKind::Dog, strings.character_dog),
+            (IDM_CHAR_GIRL, CharacterKind::Girl, strings.character_girl),
             (IDM_CHAR_BOTH, CharacterKind::Both, strings.character_both),
         ] {
             let label_str = native_interop::wide_str(label);

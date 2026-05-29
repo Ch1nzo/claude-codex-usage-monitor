@@ -52,6 +52,7 @@ pub(super) const STRINGS: Strings = Strings {
     show_characters: "Personages tonen",
     character_cat: "Kat",
     character_dog: "Hond",
+    character_girl: "Meisje",
     character_both: "Beide",
     appearance: "Uiterlijk",
     segment_count: "Aantal segmenten",

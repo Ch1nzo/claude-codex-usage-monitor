@@ -52,6 +52,7 @@ pub(super) const STRINGS: Strings = Strings {
     show_characters: "顯示角色",
     character_cat: "貓",
     character_dog: "狗",
+    character_girl: "女孩",
     character_both: "兩者",
     appearance: "外觀",
     segment_count: "分段數",

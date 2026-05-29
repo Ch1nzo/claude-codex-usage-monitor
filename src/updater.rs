@@ -137,17 +137,49 @@ pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
     let target = current_exe.to_string_lossy().to_string();
     let source = download_path.to_string_lossy().to_string();
 
-    Command::new(&helper_path)
-        .arg("--apply-update")
-        .arg(target)
-        .arg(source)
-        .arg(pid)
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Unable to launch updater helper: {e}"))?;
+    launch_helper_elevated(&helper_path, &target, &source, &pid)?;
+
+    Ok(())
+}
+
+// Launch the updater helper with administrator rights via the shell "runas"
+// verb. Some machines have the install directory locked down so the in-place
+// binary replacement fails without elevation; "runas" raises a UAC prompt and
+// runs the helper elevated so the update can complete. A plain spawn() bypasses
+// the shell and would fail silently instead of prompting.
+fn launch_helper_elevated(
+    helper_path: &Path,
+    target: &str,
+    source: &str,
+    pid: &str,
+) -> Result<(), String> {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+    let params = format!("--apply-update \"{target}\" \"{source}\" {pid}");
+    let verb_w = wide_str("runas");
+    let file_w = wide_str(&helper_path.to_string_lossy());
+    let params_w = wide_str(&params);
+
+    let result = unsafe {
+        ShellExecuteW(
+            HWND::default(),
+            PCWSTR::from_raw(verb_w.as_ptr()),
+            PCWSTR::from_raw(file_w.as_ptr()),
+            PCWSTR::from_raw(params_w.as_ptr()),
+            PCWSTR::null(),
+            SW_HIDE,
+        )
+    };
+
+    // ShellExecuteW returns a value <= 32 on failure, including when the user
+    // declines the UAC prompt.
+    if result.0 as isize <= 32 {
+        return Err(format!(
+            "Unable to launch updater helper with administrator rights (code {}).",
+            result.0 as isize
+        ));
+    }
 
     Ok(())
 }
@@ -289,12 +321,12 @@ fn replace_target_binary(target: &Path, source: &Path) -> Result<(), String> {
 }
 
 fn relaunch_target(target: &Path) -> Result<(), String> {
-    let mut command = Command::new(target);
-    if let Some(parent) = target.parent() {
-        command.current_dir(parent);
-    }
-
-    command
+    // The updater helper runs elevated (see launch_helper_elevated), so spawning
+    // the app directly would inherit that elevation and leave the widget running
+    // as administrator. explorer.exe runs at the logged-in user's medium
+    // integrity level, so launching the app through it starts it non-elevated.
+    Command::new("explorer.exe")
+        .arg(target)
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

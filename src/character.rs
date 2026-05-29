@@ -46,6 +46,7 @@ const BASE_OY: i32 = WIN_LH - SPRITE - 2;
 const HOVER_DELAY_TICKS: u64 = 12; // ~1.0s before the hover message shows
 const CLICK_BUBBLE_TICKS: u32 = 31; // ~2.5s
 const CLICKED_POSE_TICKS: u32 = 6; // ~0.4s
+const KISS_TICKS: u32 = 26; // ~2.1s of kiss face + rising hearts (girl only)
 const HOVER_BUBBLE_TICKS: u32 = 36;
 const THRESHOLD_BUBBLE_TICKS: u32 = 50;
 const IDLE_BUBBLE_TICKS: u32 = 30;
@@ -62,6 +63,7 @@ const PRI_THRESHOLD: u8 = 3;
 pub enum CharacterKind {
     Cat,
     Dog,
+    Girl,
     Both,
 }
 
@@ -70,6 +72,7 @@ impl CharacterKind {
         match self {
             CharacterKind::Cat => "cat",
             CharacterKind::Dog => "dog",
+            CharacterKind::Girl => "girl",
             CharacterKind::Both => "both",
         }
     }
@@ -78,6 +81,7 @@ impl CharacterKind {
         match code {
             "cat" => Some(CharacterKind::Cat),
             "dog" => Some(CharacterKind::Dog),
+            "girl" => Some(CharacterKind::Girl),
             "both" => Some(CharacterKind::Both),
             _ => None,
         }
@@ -89,6 +93,10 @@ impl CharacterKind {
 
     fn shows_dog(self) -> bool {
         matches!(self, CharacterKind::Dog | CharacterKind::Both)
+    }
+
+    fn shows_girl(self) -> bool {
+        matches!(self, CharacterKind::Girl)
     }
 }
 
@@ -150,8 +158,15 @@ struct Bubble {
     pri: u8,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Species {
+    Cat,
+    Dog,
+    Girl,
+}
+
 struct Critter {
-    is_cat: bool,
+    species: Species,
     variant: u8,
     x: f32,
     dir: f32,
@@ -165,12 +180,16 @@ struct Critter {
     blink_ctr: u32,
     bubble: Option<Bubble>,
     last_idx: [i32; POOL_COUNT],
+    // Kiss reaction (girl only): countdown ticks for the puckered face + the
+    // floating hearts. 0 = not kissing.
+    kiss: u32,
+    kiss_max: u32,
 }
 
 impl Critter {
-    fn new(is_cat: bool, variant: u8, x: f32, dir: f32) -> Self {
+    fn new(species: Species, variant: u8, x: f32, dir: f32) -> Self {
         Self {
-            is_cat,
+            species,
             variant,
             x,
             dir,
@@ -184,6 +203,8 @@ impl Critter {
             blink_ctr: 0,
             bubble: None,
             last_idx: [-1; POOL_COUNT],
+            kiss: 0,
+            kiss_max: 0,
         }
     }
 
@@ -213,6 +234,8 @@ struct CharState {
     frame: u64,
     cat: Critter,
     dog: Critter,
+    girl: Critter,
+    usage: f64,
     last_band: Band,
     mood: Band,
     last_idle_frame: u64,
@@ -242,7 +265,7 @@ fn rng_next() -> u64 {
 
 /// Pick a random message from the pool without repeating the previous one.
 fn pick_message(critter: &mut Critter, lang: LanguageId, pool: Pool) -> String {
-    let msgs = message_pool(lang, critter.is_cat, pool);
+    let msgs = message_pool(lang, critter.species, pool);
     if msgs.is_empty() {
         return String::new();
     }
@@ -343,8 +366,10 @@ pub fn init(
         win_w,
         win_h,
         frame: 0,
-        cat: Critter::new(true, cat_variant & 1, 8.0, 1.0),
-        dog: Critter::new(false, dog_variant & 1, max_x - 8.0, -1.0),
+        cat: Critter::new(Species::Cat, cat_variant & 1, 8.0, 1.0),
+        dog: Critter::new(Species::Dog, dog_variant & 1, max_x - 8.0, -1.0),
+        girl: Critter::new(Species::Girl, 0, 8.0, 1.0),
+        usage: 0.0,
         last_band: Band::Low,
         mood: Band::Low,
         last_idle_frame: 0,
@@ -516,6 +541,7 @@ pub fn on_usage_update(
         return;
     };
     s.lang = lang;
+    s.usage = max_percent; // drives the girl character's clothing stage
     if !s.enabled {
         return;
     }
@@ -556,6 +582,13 @@ pub fn on_usage_update(
                 s.dog.react_ticks = 12;
             }
         }
+        if kind.shows_girl() {
+            let text = pick_message(&mut s.girl, lang, pool);
+            set_bubble(&mut s.girl, text, THRESHOLD_BUBBLE_TICKS, PRI_THRESHOLD);
+            if do_react {
+                s.girl.react_ticks = 12;
+            }
+        }
         return; // don't also fire a prediction this update
     }
 
@@ -582,6 +615,10 @@ pub fn on_usage_update(
                     if kind.shows_dog() {
                         let text = prediction_message(lang, false, &hhmm);
                         set_bubble(&mut s.dog, text, THRESHOLD_BUBBLE_TICKS, PRI_CLICK);
+                    }
+                    if kind.shows_girl() {
+                        let text = girl_prediction(lang, &hhmm);
+                        set_bubble(&mut s.girl, text, THRESHOLD_BUBBLE_TICKS, PRI_CLICK);
                     }
                 }
             }
@@ -634,6 +671,19 @@ fn prediction_message(lang: LanguageId, is_cat: bool, hhmm: &str) -> String {
         (LanguageId::TraditionalChinese, false) => format!("糟糕，{hhmm}就100%！！"),
         (LanguageId::English, true) => format!("at this pace... done by {hhmm}."),
         (LanguageId::English, false) => format!("uh oh, 100% by {hhmm}!!"),
+    }
+}
+
+fn girl_prediction(lang: LanguageId, hhmm: &str) -> String {
+    match lang {
+        LanguageId::Japanese => format!("このペースだと{hhmm}には危ないかも…"),
+        LanguageId::German => format!("in dem Tempo... {hhmm} wird knapp!"),
+        LanguageId::Dutch => format!("in dit tempo... {hhmm} wordt spannend!"),
+        LanguageId::Spanish => format!("a este ritmo... ¡{hhmm} pinta mal!"),
+        LanguageId::French => format!("à ce rythme... {hhmm} ça craint !"),
+        LanguageId::Korean => format!("이 속도면... {hhmm}쯤 위험해!"),
+        LanguageId::TraditionalChinese => format!("照這速度…{hhmm}就危險了！"),
+        LanguageId::English => format!("at this pace... {hhmm} looks risky!"),
     }
 }
 
@@ -732,6 +782,10 @@ fn on_mouse_move(hwnd: HWND, x: i32, y: i32) {
         let over = point_in(&s.dog, uscale, x, y);
         changed |= update_hover(&mut s.dog, over, frame);
     }
+    if kind.shows_girl() {
+        let over = point_in(&s.girl, uscale, x, y);
+        changed |= update_hover(&mut s.girl, over, frame);
+    }
     if changed {
         drop(guard);
         render();
@@ -769,6 +823,11 @@ fn on_mouse_leave() {
         s.dog.hover_since = None;
         changed = true;
     }
+    if s.girl.hovering {
+        s.girl.hovering = false;
+        s.girl.hover_since = None;
+        changed = true;
+    }
     if changed {
         drop(guard);
         render();
@@ -794,6 +853,15 @@ fn on_click(x: i32, y: i32) {
         s.dog.clicked_ticks = CLICKED_POSE_TICKS;
         let text = pick_message(&mut s.dog, lang, Pool::Click);
         set_bubble(&mut s.dog, text, CLICK_BUBBLE_TICKS, PRI_CLICK);
+        hit = true;
+    }
+    if kind.shows_girl() && point_in(&s.girl, uscale, x, y) {
+        // The girl blows a kiss (puckered face + floating hearts) instead of the
+        // generic click hop the cat/dog use.
+        s.girl.kiss = KISS_TICKS;
+        s.girl.kiss_max = KISS_TICKS;
+        let text = pick_message(&mut s.girl, lang, Pool::Click);
+        set_bubble(&mut s.girl, text, CLICK_BUBBLE_TICKS, PRI_CLICK);
         hit = true;
     }
     if hit {
@@ -823,6 +891,9 @@ fn tick() {
         if kind.shows_dog() {
             step_critter(&mut s.dog, frame, lang, max_x, 0.7);
         }
+        if kind.shows_girl() {
+            step_critter(&mut s.girl, frame, lang, max_x, 0.5);
+        }
     }
     render();
 }
@@ -834,6 +905,9 @@ fn step_critter(c: &mut Critter, frame: u64, lang: LanguageId, max_x: f32, speed
     }
     if c.react_ticks > 0 {
         c.react_ticks -= 1;
+    }
+    if c.kiss > 0 {
+        c.kiss -= 1;
     }
 
     // Hover bubble after the dwell delay.
@@ -847,7 +921,7 @@ fn step_critter(c: &mut Critter, frame: u64, lang: LanguageId, max_x: f32, speed
     }
 
     // Idle <-> walk cycling (don't move while hovering or clicked).
-    let frozen = c.hovering || c.clicked_ticks > 0;
+    let frozen = c.hovering || c.clicked_ticks > 0 || c.kiss > 0;
     if !frozen {
         if c.move_ticks == 0 {
             c.moving = !c.moving;
@@ -1226,6 +1300,227 @@ fn draw_character(
     }
 }
 
+/// Clothing stage for the girl character: higher usage sheds more layers, ending
+/// in swimwear near 100%. 0 = fully dressed, 3 = bikini only.
+fn girl_stage(usage: f64) -> u8 {
+    if usage >= 90.0 {
+        3
+    } else if usage >= 75.0 {
+        2
+    } else if usage >= 60.0 {
+        1
+    } else {
+        0
+    }
+}
+
+/// Draw a small pixel heart at grid coords (`hx`,`hy`). `big` selects a slightly
+/// larger shape. Mirrored consistently with the girl sprite so hearts sit on her
+/// facing side.
+#[allow(clippy::too_many_arguments)]
+fn draw_heart(
+    bits: &mut [u32],
+    w: i32,
+    h: i32,
+    ox: i32,
+    oy: i32,
+    u: i32,
+    mirror: bool,
+    hx: i32,
+    hy: i32,
+    big: bool,
+) {
+    let pink = bgra(240, 92, 132);
+    let pink_hi = bgra(255, 156, 184);
+    let mut cell = |gx: i32, gy: i32, color: u32| {
+        let ax = if mirror { SPRITE - gx - 1 } else { gx };
+        fill_block(bits, w, h, ox + ax * u, oy + gy * u, u, u, color);
+    };
+    let pat: &[(i32, i32)] = if big {
+        &[
+            (0, 0), (1, 0), (3, 0), (4, 0),
+            (0, 1), (1, 1), (2, 1), (3, 1), (4, 1),
+            (1, 2), (2, 2), (3, 2),
+            (2, 3),
+        ]
+    } else {
+        &[(0, 0), (2, 0), (0, 1), (1, 1), (2, 1), (1, 2)]
+    };
+    for (px, py) in pat {
+        cell(hx + px, hy + py, pink);
+    }
+    cell(hx, hy, pink_hi);
+}
+
+/// Draw the chibi girl on the 32x32 grid (facing right; `mirror` flips her).
+/// As `usage` rises she sheds outer layers down to swimwear (see `girl_stage`).
+#[allow(clippy::too_many_arguments)]
+fn draw_girl(
+    bits: &mut [u32],
+    w: i32,
+    h: i32,
+    ox: i32,
+    oy: i32,
+    u: i32,
+    mirror: bool,
+    anim: &Anim,
+    mood: Band,
+    usage: f64,
+    kiss: u32,
+    kiss_max: u32,
+    frame: u64,
+) {
+    let dy = anim.body_dy;
+    let stage = girl_stage(usage);
+    let kissing = kiss > 0;
+
+    let skin = bgra(255, 222, 196);
+    let skin_sh = bgra(232, 190, 165);
+    let hair = bgra(116, 80, 62);
+    let hair_hi = bgra(150, 108, 82);
+    let eye = bgra(96, 134, 176);
+    let white = bgra(255, 255, 255);
+    let mouth = bgra(196, 96, 96);
+    let blush = bgra(255, 170, 170);
+    let bikini = bgra(232, 84, 120);
+    let bikini_tr = bgra(198, 56, 96);
+    let shirt = bgra(250, 250, 252);
+    let shirt_sh = bgra(224, 226, 234);
+    let skirt = bgra(92, 120, 200);
+    let skirt_sh = bgra(70, 96, 168);
+    let jacket = bgra(245, 198, 86);
+
+    // Place a block addressed on the 32-grid facing right; `mirror` flips it and
+    // `bob` applies the breathing/jump offset (legs stay planted, so pass false).
+    let place = |bits: &mut [u32], x: i32, y: i32, bw: i32, bh: i32, color: u32, bob: bool| {
+        let yy = if bob { y + dy } else { y };
+        let ax = if mirror { SPRITE - x - bw } else { x };
+        fill_block(bits, w, h, ox + ax * u, oy + yy * u, bw * u, bh * u, color);
+    };
+
+    // Hair behind the head + twin tails.
+    place(bits, 7, 3, 18, 15, hair, true);
+    let tail = anim.tail_dy;
+    let ax_l = if mirror { SPRITE - 4 - 3 } else { 4 };
+    let ax_r = if mirror { SPRITE - 25 - 3 } else { 25 };
+    fill_block(bits, w, h, ox + ax_l * u, oy + (8 + dy + tail) * u, 3 * u, 9 * u, hair);
+    fill_block(bits, w, h, ox + ax_r * u, oy + (8 + dy + tail) * u, 3 * u, 9 * u, hair);
+
+    // Head.
+    place(bits, 9, 5, 14, 12, skin, true);
+    place(bits, 11, 15, 10, 2, skin_sh, true);
+
+    // Neck, torso, arms (skin).
+    place(bits, 14, 16, 4, 2, skin, true);
+    place(bits, 11, 18, 10, 8, skin, true);
+    place(bits, 8, 18, 3, 7, skin, true);
+    place(bits, 21, 18, 3, 7, skin, true);
+
+    // Legs (planted; animate with the walk offsets).
+    let lb = 12 + anim.leg_back_dx;
+    let lf = 17 + anim.leg_front_dx;
+    let axb = if mirror { SPRITE - lb - 3 } else { lb };
+    let axf = if mirror { SPRITE - lf - 3 } else { lf };
+    fill_block(bits, w, h, ox + axb * u, oy + 26 * u, 3 * u, 5 * u, skin);
+    fill_block(bits, w, h, ox + axf * u, oy + 26 * u, 3 * u, 5 * u, skin);
+
+    // Bottom layer: skirt while dressed, bikini bottom at the top stage.
+    if stage <= 2 {
+        place(bits, 10, 24, 12, 5, skirt, true);
+        place(bits, 10, 27, 12, 2, skirt_sh, true);
+    } else {
+        place(bits, 12, 24, 8, 3, bikini, true);
+        place(bits, 12, 24, 8, 1, bikini_tr, true);
+    }
+    // Top layer: shirt, then bikini top as the shirt comes off.
+    if stage <= 1 {
+        place(bits, 11, 17, 10, 8, shirt, true);
+        place(bits, 11, 23, 10, 2, shirt_sh, true);
+        place(bits, 8, 18, 3, 4, shirt, true);
+        place(bits, 21, 18, 3, 4, shirt, true);
+    } else {
+        place(bits, 11, 18, 10, 3, bikini, true);
+        place(bits, 11, 20, 10, 1, bikini_tr, true);
+        place(bits, 12, 17, 1, 2, bikini_tr, true);
+        place(bits, 19, 17, 1, 2, bikini_tr, true);
+    }
+    // Jacket: only at the fully-dressed stage.
+    if stage == 0 {
+        place(bits, 8, 17, 3, 9, jacket, true);
+        place(bits, 21, 17, 3, 9, jacket, true);
+        place(bits, 10, 17, 12, 2, jacket, true);
+    }
+
+    // Hair front (bangs + side locks) over the forehead.
+    place(bits, 9, 4, 14, 4, hair, true);
+    place(bits, 10, 4, 5, 2, hair_hi, true);
+    place(bits, 7, 6, 2, 10, hair, true);
+    place(bits, 23, 6, 2, 10, hair, true);
+
+    // Face. When blowing a kiss she closes her eyes happily and puckers her
+    // lips; otherwise normal eyes (closed only on a blink).
+    let lips = bgra(228, 72, 96);
+    if kissing {
+        // Happy closed "^ ^" eyes.
+        place(bits, 11, 11, 3, 1, eye, true);
+        place(bits, 12, 12, 1, 1, eye, true);
+        place(bits, 18, 11, 3, 1, eye, true);
+        place(bits, 19, 12, 1, 1, eye, true);
+    } else if anim.blink {
+        place(bits, 11, 12, 3, 1, skin_sh, true);
+        place(bits, 18, 12, 3, 1, skin_sh, true);
+    } else {
+        place(bits, 11, 10, 3, 4, eye, true);
+        place(bits, 18, 10, 3, 4, eye, true);
+        place(bits, 12, 10, 1, 1, white, true);
+        place(bits, 19, 10, 1, 1, white, true);
+    }
+    place(bits, 10, 13, 2, 2, blush, true);
+    place(bits, 20, 13, 2, 2, blush, true);
+
+    if kissing {
+        // Stronger blush + a small puckered mouth.
+        place(bits, 9, 13, 2, 2, blush, true);
+        place(bits, 21, 13, 2, 2, blush, true);
+        place(bits, 15, 14, 2, 2, lips, true);
+        place(bits, 15, 15, 2, 1, bgra(196, 56, 80), true);
+    } else {
+        place(bits, 15, 14, 2, 1, mouth, true);
+        match mood {
+            Band::Soft => {
+                place(bits, 23, 6, 1, 2, bgra(150, 205, 240), true);
+            }
+            Band::Urgent => {
+                place(bits, 9, 13, 3, 2, blush, true);
+                place(bits, 19, 13, 3, 2, blush, true);
+                place(bits, 15, 14, 2, 2, mouth, true);
+            }
+            Band::Low => {}
+        }
+    }
+
+    // Floating hearts during the kiss: they rise and fade as the timer runs out.
+    if kissing && kiss_max > 0 {
+        let elapsed = kiss_max - kiss; // 0..kiss_max
+        // Base near the mouth, drifting up and to the facing side.
+        let drift = (elapsed as i32) / 2; // rows risen
+        let side = if mirror { -1 } else { 1 };
+        let hearts = [
+            (16, 12 - drift, frame % 2 == 0),
+            (19, 14 - drift + 2, (frame / 2) % 2 == 0),
+            (13, 13 - drift + 4, (frame / 3) % 2 == 0),
+        ];
+        for (i, (hx, hy, big)) in hearts.iter().enumerate() {
+            // Stagger so later hearts only appear after the first has risen.
+            if (elapsed as usize) < i * 4 {
+                continue;
+            }
+            let wobble = if *big { side } else { 0 };
+            draw_heart(bits, w, h, ox, oy, u, mirror, *hx + wobble, *hy, *big);
+        }
+    }
+}
+
 fn render() {
     let (
         hwnd,
@@ -1234,8 +1529,10 @@ fn render() {
         u,
         kind,
         frame,
+        usage,
         cat_snapshot,
         dog_snapshot,
+        girl_snapshot,
     ) = {
         let guard = STATE.lock().unwrap();
         let Some(s) = guard.as_ref() else {
@@ -1251,8 +1548,10 @@ fn render() {
             s.uscale,
             s.kind,
             s.frame,
+            s.usage,
             snapshot(&s.cat, s.mood),
             snapshot(&s.dog, s.mood),
+            snapshot(&s.girl, s.mood),
         )
     };
 
@@ -1334,6 +1633,25 @@ fn render() {
                 dog_snapshot.mood,
             );
         }
+        if kind.shows_girl() {
+            let ox = (girl_snapshot.x * u as f32) as i32 + shake(girl_snapshot.mood);
+            let anim = anim_for(girl_snapshot.pose, frame, girl_snapshot.blink_ctr);
+            draw_girl(
+                bits,
+                win_w,
+                win_h,
+                ox,
+                base_oy,
+                u,
+                girl_snapshot.dir < 0.0,
+                &anim,
+                girl_snapshot.mood,
+                usage,
+                girl_snapshot.kiss,
+                girl_snapshot.kiss_max,
+                frame,
+            );
+        }
 
         // Bubbles (drawn after characters so they sit on top). When both are
         // visible, the dog bubble is nudged up so they don't overlap.
@@ -1363,6 +1681,22 @@ fn render() {
                     win_h,
                     u,
                     dog_snapshot.x,
+                    &b.text,
+                    b.ttl,
+                    b.max_ttl,
+                    &mut bubble_rows_used,
+                );
+            }
+        }
+        if kind.shows_girl() {
+            if let Some(b) = &girl_snapshot.bubble {
+                draw_bubble(
+                    mem_dc,
+                    bits,
+                    win_w,
+                    win_h,
+                    u,
+                    girl_snapshot.x,
                     &b.text,
                     b.ttl,
                     b.max_ttl,
@@ -1409,6 +1743,8 @@ struct Snapshot {
     blink_ctr: u32,
     mood: Band,
     bubble: Option<BubbleSnap>,
+    kiss: u32,
+    kiss_max: u32,
 }
 
 struct BubbleSnap {
@@ -1430,6 +1766,8 @@ fn snapshot(c: &Critter, mood: Band) -> Snapshot {
             ttl: b.ttl,
             max_ttl: b.max_ttl,
         }),
+        kiss: c.kiss,
+        kiss_max: c.kiss_max,
     }
 }
 
@@ -1549,7 +1887,11 @@ fn draw_bubble(
 // All eight UI languages have their own pools (translations preserve each
 // character's personality rather than being literal).
 
-fn message_pool(lang: LanguageId, is_cat: bool, pool: Pool) -> &'static [&'static str] {
+fn message_pool(lang: LanguageId, species: Species, pool: Pool) -> &'static [&'static str] {
+    if species == Species::Girl {
+        return girl_pool(lang, pool);
+    }
+    let is_cat = species == Species::Cat;
     match lang {
         LanguageId::Japanese => ja_pool(is_cat, pool),
         LanguageId::German => de_pool(is_cat, pool),
@@ -1559,6 +1901,85 @@ fn message_pool(lang: LanguageId, is_cat: bool, pool: Pool) -> &'static [&'stati
         LanguageId::Korean => ko_pool(is_cat, pool),
         LanguageId::TraditionalChinese => zh_pool(is_cat, pool),
         LanguageId::English => en_pool(is_cat, pool),
+    }
+}
+
+/// The girl character: cute and upbeat, growing flustered as usage climbs (her
+/// outfit thins out toward swimwear). One pool set, localized per language.
+fn girl_pool(lang: LanguageId, pool: Pool) -> &'static [&'static str] {
+    match lang {
+        LanguageId::Japanese => match pool {
+            Pool::Hover => &["やっほー♪", "どうしたの？", "こっち見てる？"],
+            Pool::Click => &["きゃっ♪", "なになに？", "えへへ"],
+            Pool::Idle => &["ふんふん♪", "ひまだなあ", "…"],
+            Pool::Soft => &["8割こえちゃった…", "そろそろ注意してね？", "ちょっとペース速いかも"],
+            Pool::Urgent => &["もう9割っ…！", "み、見ないで〜！", "限界きちゃう！"],
+            Pool::Rest => &["おつかれさま♪", "今日もがんばったね", "ひと休みしよ？"],
+            Pool::Encourage => &["いい調子だよ♪", "その調子！", "まだ余裕だね"],
+        },
+        LanguageId::English => match pool {
+            Pool::Hover => &["hi there♪", "what's up?", "you're looking?"],
+            Pool::Click => &["eek♪", "yes? hehe", "what is it?"],
+            Pool::Idle => &["la la la♪", "kinda bored", "..."],
+            Pool::Soft => &["past 80%...", "careful, okay?", "slowing down maybe?"],
+            Pool::Urgent => &["over 90%...!", "d-don't look~!", "I'm at my limit!"],
+            Pool::Rest => &["nice work♪", "you did great today", "let's take a break?"],
+            Pool::Encourage => &["doing great♪", "keep it up!", "still room to go"],
+        },
+        LanguageId::German => match pool {
+            Pool::Hover => &["hallöchen♪", "was ist los?", "schaust du?"],
+            Pool::Click => &["hach♪", "ja? hihi", "was denn?"],
+            Pool::Idle => &["lalala♪", "etwas langweilig", "..."],
+            Pool::Soft => &["über 80%...", "vorsicht, ja?", "wird etwas schnell"],
+            Pool::Urgent => &["über 90%...!", "n-nicht hinsehen~!", "ich bin am Limit!"],
+            Pool::Rest => &["gut gemacht♪", "tolle Arbeit heute", "kleine Pause?"],
+            Pool::Encourage => &["läuft super♪", "weiter so!", "noch genug Luft"],
+        },
+        LanguageId::Dutch => match pool {
+            Pool::Hover => &["hoi♪", "wat is er?", "kijk je?"],
+            Pool::Click => &["hihi♪", "ja? hihi", "wat dan?"],
+            Pool::Idle => &["lalala♪", "beetje saai", "..."],
+            Pool::Soft => &["boven 80%...", "voorzichtig, hè?", "gaat wat snel"],
+            Pool::Urgent => &["boven 90%...!", "n-niet kijken~!", "ik zit aan m'n grens!"],
+            Pool::Rest => &["goed gedaan♪", "top vandaag", "even pauze?"],
+            Pool::Encourage => &["gaat goed♪", "ga zo door!", "nog ruimte zat"],
+        },
+        LanguageId::Spanish => match pool {
+            Pool::Hover => &["¡holaa♪", "¿qué pasa?", "¿me miras?"],
+            Pool::Click => &["¡ay♪", "¿sí? jiji", "¿qué pasa?"],
+            Pool::Idle => &["lalala♪", "qué aburrido", "..."],
+            Pool::Soft => &["más del 80%...", "cuidado, ¿sí?", "vas un poco rápido"],
+            Pool::Urgent => &["¡más del 90%...!", "¡n-no mires~!", "¡estoy al límite!"],
+            Pool::Rest => &["¡bien hecho♪", "hoy lo hiciste genial", "¿un descanso?"],
+            Pool::Encourage => &["¡vas genial♪", "¡sigue así!", "aún queda margen"],
+        },
+        LanguageId::French => match pool {
+            Pool::Hover => &["coucou♪", "qu'y a-t-il ?", "tu regardes ?"],
+            Pool::Click => &["hihi♪", "oui ? héhé", "quoi donc ?"],
+            Pool::Idle => &["lalala♪", "un peu ennuyée", "..."],
+            Pool::Soft => &["plus de 80%...", "attention, hein ?", "ça va un peu vite"],
+            Pool::Urgent => &["plus de 90%...!", "n-ne regarde pas~!", "je suis à la limite !"],
+            Pool::Rest => &["bien joué♪", "super boulot aujourd'hui", "une petite pause ?"],
+            Pool::Encourage => &["ça roule♪", "continue !", "encore de la marge"],
+        },
+        LanguageId::Korean => match pool {
+            Pool::Hover => &["야호♪", "무슨 일이야?", "보고 있어?"],
+            Pool::Click => &["꺄♪", "응? 헤헤", "왜왜?"],
+            Pool::Idle => &["흥얼흥얼♪", "좀 심심해", "..."],
+            Pool::Soft => &["80% 넘었어...", "조심하자, 응?", "조금 빠른 듯"],
+            Pool::Urgent => &["90% 넘었어...!", "보, 보지 마~!", "한계야!"],
+            Pool::Rest => &["수고했어♪", "오늘 정말 잘했어", "좀 쉬자?"],
+            Pool::Encourage => &["잘하고 있어♪", "그 기세야!", "아직 여유 있어"],
+        },
+        LanguageId::TraditionalChinese => match pool {
+            Pool::Hover => &["哈囉♪", "怎麼了？", "在看我嗎？"],
+            Pool::Click => &["呀♪", "嗯？嘿嘿", "幹嘛呀？"],
+            Pool::Idle => &["哼哼♪", "有點無聊", "..."],
+            Pool::Soft => &["超過八成了...", "小心一點喔？", "好像有點快"],
+            Pool::Urgent => &["超過九成了...！", "別、別看啦～！", "快到極限了！"],
+            Pool::Rest => &["辛苦了♪", "今天表現很棒", "休息一下？"],
+            Pool::Encourage => &["狀態很好♪", "繼續加油！", "還有餘裕呢"],
+        },
     }
 }
 

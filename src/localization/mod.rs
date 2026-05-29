@@ -170,6 +170,7 @@ pub struct Strings {
     pub show_characters: &'static str,
     pub character_cat: &'static str,
     pub character_dog: &'static str,
+    pub character_girl: &'static str,
     pub character_both: &'static str,
     pub appearance: &'static str,
     pub segment_count: &'static str,
