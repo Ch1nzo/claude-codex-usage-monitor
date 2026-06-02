@@ -4,6 +4,13 @@ on:
   push:
     tags:
       - "v*"
+  # Manual re-run from the Actions tab (e.g. after a transient failure). Provide
+  # the tag to release, e.g. "v1.3.1".
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v1.3.1)"
+        required: true
 
 permissions:
   contents: write
@@ -12,15 +19,20 @@ env:
   RELEASE_ASSET_NAME: claude-codex-usage-monitor.exe
   INSTALLER_NAME: claude-codex-usage-monitor-setup.exe
 
+# Only actions/checkout (a GitHub-authored action) is used; everything else runs
+# via tools preinstalled on the runner (Rust/cargo, the gh CLI) plus Chocolatey
+# for NSIS. This keeps the workflow working even under a strict Actions policy
+# that only allows GitHub-owned actions.
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
+          # On a tag push, github.ref is the tag. On manual dispatch, check out
+          # the requested tag so we build the released code.
+          ref: ${{ github.event.inputs.tag || github.ref }}
           fetch-depth: 0
-
-      - uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binary
         run: cargo build --release
@@ -35,10 +47,30 @@ jobs:
             /DEXE_SOURCE=..\target\release\claude-codex-usage-monitor.exe `
             installer\claude-codex-usage-monitor.nsi
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            installer/${{ env.INSTALLER_NAME }}
-            target/release/${{ env.RELEASE_ASSET_NAME }}
-          generate_release_notes: true
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          INSTALLER="installer/${INSTALLER_NAME}"
+          BINARY="target/release/${RELEASE_ASSET_NAME}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Release already exists (e.g. a re-run): replace the assets.
+            gh release upload "$TAG" "$INSTALLER" "$BINARY" --clobber
+          else
+            gh release create "$TAG" "$INSTALLER" "$BINARY" \
+              --title "$TAG" \
+              --generate-notes
+          fi
