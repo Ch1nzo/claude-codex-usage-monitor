@@ -511,11 +511,24 @@ fn default_true() -> bool {
 }
 
 fn load_settings() -> SettingsFile {
-    let content = match std::fs::read_to_string(settings_path()) {
+    let path = settings_path();
+    let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(_) => return SettingsFile::default(),
     };
-    let mut settings: SettingsFile = serde_json::from_str(&content).unwrap_or_default();
+    // `#[serde(default)]` covers missing fields, but a malformed file (wrong
+    // type on one field, manual edit error) would otherwise silently reset every
+    // saved setting. Log it and keep a .bak copy so the reset is diagnosable and
+    // the user can recover their old settings.
+    let mut settings: SettingsFile = match serde_json::from_str(&content) {
+        Ok(s) => s,
+        Err(error) => {
+            diagnose::log_error("settings parse failed; reverting to defaults", &error);
+            let backup = path.with_extension("json.bak");
+            let _ = std::fs::copy(&path, &backup);
+            SettingsFile::default()
+        }
+    };
     if !settings.show_claude_code && !settings.show_codex {
         settings.show_claude_code = true;
     }
@@ -1595,6 +1608,11 @@ fn render_layered() {
             CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap_or_default();
 
         if dib.is_invalid() || bits.is_null() {
+            // A valid bitmap with a null bits pointer shouldn't happen, but if it
+            // does, still free the bitmap so we don't leak it.
+            if !dib.is_invalid() {
+                let _ = DeleteObject(dib);
+            }
             let _ = DeleteDC(mem_dc);
             ReleaseDC(hwnd, screen_dc);
             return;

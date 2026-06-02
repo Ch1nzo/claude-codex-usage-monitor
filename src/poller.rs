@@ -957,26 +957,70 @@ fn is_token_expired(expires_at: Option<i64>) -> bool {
 }
 
 /// Parse an ISO 8601 timestamp string into a SystemTime.
+///
+/// Handles `Z`, `+hh:mm` and `-hh:mm` (and the colon-less `±hhmm`) offsets, and
+/// normalizes the result to UTC. The API currently emits `+00:00`, but handling
+/// the general case keeps the reset time correct (and crash-free) for any valid
+/// offset rather than silently dropping or mis-converting it.
 fn parse_iso8601(s: Option<&str>) -> Option<SystemTime> {
-    let s = s?;
-    // Strip timezone offset to get "YYYY-MM-DDTHH:MM:SS" or with fractional seconds
-    // The API returns formats like "2026-03-05T08:00:00.321598+00:00"
-    let datetime_part = s.split('+').next().unwrap_or(s);
-    let datetime_part = datetime_part.split('Z').next().unwrap_or(datetime_part);
+    let s = s?.trim();
+    // Split "YYYY-MM-DDThh:mm:ss[.frac]" from any trailing timezone designator.
+    let t_idx = s.find('T')?;
+    let date = &s[..t_idx];
+    let time_and_tz = &s[t_idx + 1..];
+    let (time_part, offset_secs) = split_timezone(time_and_tz);
 
-    // Try parsing with and without fractional seconds
-    let formats = ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"];
-    for fmt in &formats {
-        if let Ok(secs) = parse_datetime_to_unix(datetime_part, fmt) {
-            return Some(UNIX_EPOCH + Duration::from_secs(secs));
-        }
+    let naive = format!("{date}T{time_part}");
+    let wall_secs = parse_datetime_to_unix(&naive).ok()?;
+
+    // `wall_secs` is the wall-clock time read as if UTC; subtract the offset to
+    // get true UTC (e.g. 08:00+09:00 -> 23:00 the previous day in UTC).
+    let utc = wall_secs as i64 - offset_secs;
+    if utc < 0 {
+        return None;
     }
-    None
+    Some(UNIX_EPOCH + Duration::from_secs(utc as u64))
 }
 
-/// Minimal datetime parser — avoids pulling in chrono/time crates.
-fn parse_datetime_to_unix(s: &str, _fmt: &str) -> Result<u64, ()> {
-    // Extract date and time parts from "YYYY-MM-DDTHH:MM:SS[.frac]"
+/// Split a time portion `"hh:mm:ss[.frac][Z|±hh:mm]"` into the bare time string
+/// and the offset in seconds (positive east of UTC). Returns offset 0 when none
+/// is present.
+fn split_timezone(time: &str) -> (&str, i64) {
+    if let Some(stripped) = time.strip_suffix('Z').or_else(|| time.strip_suffix('z')) {
+        return (stripped, 0);
+    }
+    // The time itself contains no '+'/'-', so the right-most one marks the
+    // offset (e.g. "08:00:00.5-05:00" -> sign '-', "05:00").
+    for (i, c) in time.char_indices().rev() {
+        if c == '+' || c == '-' {
+            let sign = if c == '-' { -1 } else { 1 };
+            let off = parse_offset(&time[i + 1..]).unwrap_or(0);
+            return (&time[..i], sign * off);
+        }
+    }
+    (time, 0)
+}
+
+/// Parse an offset body like "05:00", "0500", or "05" into seconds.
+fn parse_offset(off: &str) -> Option<i64> {
+    let off = off.trim();
+    let (h, m) = if let Some((h, m)) = off.split_once(':') {
+        (h, m)
+    } else if off.len() == 4 {
+        (&off[..2], &off[2..])
+    } else if off.len() == 2 {
+        (off, "0")
+    } else {
+        return None;
+    };
+    let hours: i64 = h.parse().ok()?;
+    let mins: i64 = m.parse().ok()?;
+    Some(hours * 3600 + mins * 60)
+}
+
+/// Minimal datetime parser — avoids pulling in chrono/time crates. Expects a
+/// timezone-free `"YYYY-MM-DDTHH:MM:SS[.frac]"` string.
+fn parse_datetime_to_unix(s: &str) -> Result<u64, ()> {
     let (date_str, time_str) = s.split_once('T').ok_or(())?;
     let date_parts: Vec<&str> = date_str.split('-').collect();
     if date_parts.len() != 3 {
@@ -986,6 +1030,11 @@ fn parse_datetime_to_unix(s: &str, _fmt: &str) -> Result<u64, ()> {
     let year: u64 = date_parts[0].parse().map_err(|_| ())?;
     let month: u64 = date_parts[1].parse().map_err(|_| ())?;
     let day: u64 = date_parts[2].parse().map_err(|_| ())?;
+    // Range-check before using `month` to index and `day` in a subtraction —
+    // malformed values would otherwise panic (index out of bounds / overflow).
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(());
+    }
 
     // Strip fractional seconds
     let time_base = time_str.split('.').next().unwrap_or(time_str);

@@ -52,12 +52,16 @@ struct GitHubAsset {
 }
 
 pub fn handle_cli_mode(args: &[String]) -> Option<i32> {
-    if args.len() == 5 && args[1] == "--apply-update" {
+    if args.len() >= 5 && args[1] == "--apply-update" {
         let target = PathBuf::from(&args[2]);
         let source = PathBuf::from(&args[3]);
         let pid = args[4].parse::<u32>().unwrap_or(0);
+        // Optional mode token: "elevated" means the helper was relaunched with
+        // admin rights and must drop back to medium integrity on restart;
+        // anything else (or absent) means a plain, non-elevated restart.
+        let elevated = args.get(5).map(|m| m == "elevated").unwrap_or(false);
 
-        return Some(match apply_update(target, source, pid) {
+        return Some(match apply_update(target, source, pid, elevated) {
             Ok(()) => 0,
             Err(error) => {
                 show_error_message("Update failed", &error);
@@ -109,7 +113,12 @@ pub fn begin_winget_update() -> Result<(), String> {
 pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
     let current_exe =
         std::env::current_exe().map_err(|e| format!("Unable to locate current executable: {e}"))?;
-    ensure_target_location_writable(&current_exe)?;
+    // Only elevate when we actually have to. A per-user install under
+    // %LOCALAPPDATA% is writable, so the in-place replace works at medium
+    // integrity and we avoid an unnecessary UAC prompt. A locked-down location
+    // (e.g. Program Files) needs administrator rights, so we relaunch the
+    // helper elevated in that case.
+    let needs_elevation = !target_location_writable(&current_exe);
 
     let stage_dir = updates_dir()?;
     std::fs::create_dir_all(&stage_dir)
@@ -137,7 +146,36 @@ pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
     let target = current_exe.to_string_lossy().to_string();
     let source = download_path.to_string_lossy().to_string();
 
-    launch_helper_elevated(&helper_path, &target, &source, &pid)?;
+    if needs_elevation {
+        launch_helper_elevated(&helper_path, &target, &source, &pid)?;
+    } else {
+        launch_helper_plain(&helper_path, &target, &source, &pid)?;
+    }
+
+    Ok(())
+}
+
+// Launch the updater helper without elevation (the common per-user case where
+// the install directory is already writable). The relaunched app then runs at
+// the same medium integrity level as the current process.
+fn launch_helper_plain(
+    helper_path: &Path,
+    target: &str,
+    source: &str,
+    pid: &str,
+) -> Result<(), String> {
+    Command::new(helper_path)
+        .arg("--apply-update")
+        .arg(target)
+        .arg(source)
+        .arg(pid)
+        .arg("direct")
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Unable to launch updater helper: {e}"))?;
 
     Ok(())
 }
@@ -156,7 +194,7 @@ fn launch_helper_elevated(
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
-    let params = format!("--apply-update \"{target}\" \"{source}\" {pid}");
+    let params = format!("--apply-update \"{target}\" \"{source}\" {pid} elevated");
     let verb_w = wide_str("runas");
     let file_w = wide_str(&helper_path.to_string_lossy());
     let params_w = wide_str(&params);
@@ -184,7 +222,7 @@ fn launch_helper_elevated(
     Ok(())
 }
 
-fn apply_update(target: PathBuf, source: PathBuf, pid: u32) -> Result<(), String> {
+fn apply_update(target: PathBuf, source: PathBuf, pid: u32, elevated: bool) -> Result<(), String> {
     if !source.exists() {
         return Err(format!(
             "Downloaded update not found at {}",
@@ -194,7 +232,7 @@ fn apply_update(target: PathBuf, source: PathBuf, pid: u32) -> Result<(), String
 
     let _ = wait_for_process_exit(pid, Duration::from_secs(30));
     replace_target_binary(&target, &source)?;
-    relaunch_target(&target)?;
+    relaunch_target(&target, elevated)?;
     let _ = std::fs::remove_file(&source);
 
     Ok(())
@@ -320,23 +358,41 @@ fn replace_target_binary(target: &Path, source: &Path) -> Result<(), String> {
     ))
 }
 
-fn relaunch_target(target: &Path) -> Result<(), String> {
-    // The updater helper runs elevated (see launch_helper_elevated), so spawning
-    // the app directly would inherit that elevation and leave the widget running
-    // as administrator. explorer.exe runs at the logged-in user's medium
-    // integrity level, so launching the app through it starts it non-elevated.
-    Command::new("explorer.exe")
-        .arg(target)
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| {
-            format!(
-                "The update was installed, but the app could not be restarted automatically: {e}"
-            )
-        })?;
+fn relaunch_target(target: &Path, elevated: bool) -> Result<(), String> {
+    let restart_err = |e: std::io::Error| {
+        format!("The update was installed, but the app could not be restarted automatically: {e}")
+    };
+
+    if elevated {
+        // The helper runs elevated, so spawning the app directly would inherit
+        // that elevation and leave the widget running as administrator.
+        // explorer.exe runs at the logged-in user's medium integrity level, so
+        // launching the app through it starts it non-elevated. (The working
+        // directory can't be set this way, but the app reads its config from
+        // %APPDATA%, not the current directory, so that's fine.)
+        Command::new("explorer.exe")
+            .arg(target)
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(restart_err)?;
+    } else {
+        // Non-elevated helper: spawn the app directly so we keep the correct
+        // working directory and get a real success/failure signal.
+        let mut command = Command::new(target);
+        if let Some(parent) = target.parent() {
+            command.current_dir(parent);
+        }
+        command
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(restart_err)?;
+    }
 
     Ok(())
 }
@@ -419,20 +475,19 @@ fn backup_path_for(target: &Path) -> PathBuf {
     target.with_file_name(format!("{file_name}.old"))
 }
 
-fn ensure_target_location_writable(target: &Path) -> Result<(), String> {
-    let parent = target.parent().ok_or_else(|| {
-        "Unable to determine the install directory for the current executable.".to_string()
-    })?;
-
+/// Probe whether the install directory can be written without elevation, by
+/// creating and removing a temporary file next to the executable.
+fn target_location_writable(target: &Path) -> bool {
+    let Some(parent) = target.parent() else {
+        return false;
+    };
     let probe_path = parent.join(".__ccum_update_probe");
     match File::create(&probe_path) {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe_path);
-            Ok(())
+            true
         }
-        Err(error) => Err(format!(
-            "The current install location is not writable. Move the app to a user-writable folder or install it somewhere outside Program Files. {error}"
-        )),
+        Err(_) => false,
     }
 }
 
