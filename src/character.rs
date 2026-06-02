@@ -118,9 +118,13 @@ enum Pool {
     Urgent,
     Rest,
     Encourage,
+    // Periodic gentle voice-overs while usage stays in the Urgent band
+    // (>=90%). The character has stopped wandering by then; this is what it
+    // says to the user in its place.
+    Cheer,
 }
 
-const POOL_COUNT: usize = 7;
+const POOL_COUNT: usize = 8;
 
 fn pool_index(p: Pool) -> usize {
     match p {
@@ -131,6 +135,7 @@ fn pool_index(p: Pool) -> usize {
         Pool::Urgent => 4,
         Pool::Rest => 5,
         Pool::Encourage => 6,
+        Pool::Cheer => 7,
     }
 }
 
@@ -240,6 +245,7 @@ struct CharState {
     mood: Band,
     last_idle_frame: u64,
     last_pred_frame: u64,
+    last_cheer_frame: u64,
     tracking_leave: bool,
 }
 
@@ -374,6 +380,7 @@ pub fn init(
         mood: Band::Low,
         last_idle_frame: 0,
         last_pred_frame: 0,
+        last_cheer_frame: 0,
         tracking_leave: false,
     };
     *STATE.lock().unwrap() = Some(state);
@@ -550,7 +557,12 @@ pub fn on_usage_update(
     s.mood = band; // persistent facial expression
 
     let (pool, do_react) = match (s.last_band, band) {
-        (prev, Band::Urgent) if prev != Band::Urgent => (Some(Pool::Urgent), true),
+        (prev, Band::Urgent) if prev != Band::Urgent => {
+            // Reset the cheer schedule so the first periodic cheer (emitted from
+            // the animation tick) waits a full interval after this entry line.
+            s.last_cheer_frame = s.frame;
+            (Some(Pool::Urgent), true)
+        }
         (Band::Low, Band::Soft) => (Some(Pool::Soft), true),
         (prev, Band::Low) if prev != Band::Low => (Some(Pool::Rest), false),
         (Band::Low, Band::Low) => {
@@ -561,6 +573,9 @@ pub fn on_usage_update(
                 (None, false)
             }
         }
+        // Staying in the Urgent band: the periodic "cheer" voice-over is driven
+        // from the animation tick (see tick()), not here — on_usage_update only
+        // fires on a poll (every 1-60 min), which is too coarse to pace it.
         _ => (None, false),
     };
     s.last_band = band;
@@ -628,6 +643,8 @@ pub fn on_usage_update(
 
 const WINDOW_5H_SECS: f64 = 5.0 * 3600.0;
 const PRED_COOLDOWN: u64 = 1800; // ~2.4 min at 80ms/tick
+// Minimum gap between two Urgent-band cheer voice-overs, in animation ticks.
+const CHEER_COOLDOWN: u64 = 450; // ~36s at 80ms/tick
 
 /// Seconds until the 5h window would reach 100% at the current consumption
 /// pace, or None if it can't be estimated yet.
@@ -885,20 +902,48 @@ fn tick() {
         let max_x = (WIN_LW - SPRITE) as f32;
 
         let kind = s.kind;
+        let mood = s.mood;
         if kind.shows_cat() {
-            step_critter(&mut s.cat, frame, lang, max_x, 0.55);
+            step_critter(&mut s.cat, frame, lang, max_x, 0.55, mood);
         }
         if kind.shows_dog() {
-            step_critter(&mut s.dog, frame, lang, max_x, 0.7);
+            step_critter(&mut s.dog, frame, lang, max_x, 0.7, mood);
         }
         if kind.shows_girl() {
-            step_critter(&mut s.girl, frame, lang, max_x, 0.5);
+            step_critter(&mut s.girl, frame, lang, max_x, 0.5, mood);
+        }
+
+        // While held in the Urgent band the character stays put (no jitter) and
+        // instead speaks a gentle "nearly at the limit / take a break" line on a
+        // fixed cadence. Driven from the tick (every ANIM_INTERVAL_MS) so the
+        // interval is real wall-clock time, independent of the poll frequency.
+        if mood == Band::Urgent && frame.saturating_sub(s.last_cheer_frame) >= CHEER_COOLDOWN {
+            s.last_cheer_frame = frame;
+            if kind.shows_cat() {
+                let text = pick_message(&mut s.cat, lang, Pool::Cheer);
+                set_bubble(&mut s.cat, text, THRESHOLD_BUBBLE_TICKS, PRI_THRESHOLD);
+            }
+            if kind.shows_dog() {
+                let text = pick_message(&mut s.dog, lang, Pool::Cheer);
+                set_bubble(&mut s.dog, text, THRESHOLD_BUBBLE_TICKS, PRI_THRESHOLD);
+            }
+            if kind.shows_girl() {
+                let text = pick_message(&mut s.girl, lang, Pool::Cheer);
+                set_bubble(&mut s.girl, text, THRESHOLD_BUBBLE_TICKS, PRI_THRESHOLD);
+            }
         }
     }
     render();
 }
 
-fn step_critter(c: &mut Critter, frame: u64, lang: LanguageId, max_x: f32, speed: f32) {
+fn step_critter(
+    c: &mut Critter,
+    frame: u64,
+    lang: LanguageId,
+    max_x: f32,
+    speed: f32,
+    mood: Band,
+) {
     // Transient pose timers.
     if c.clicked_ticks > 0 {
         c.clicked_ticks -= 1;
@@ -920,8 +965,14 @@ fn step_critter(c: &mut Critter, frame: u64, lang: LanguageId, max_x: f32, speed
         }
     }
 
-    // Idle <-> walk cycling (don't move while hovering or clicked).
-    let frozen = c.hovering || c.clicked_ticks > 0 || c.kiss > 0;
+    // Idle <-> walk cycling. Also stop wandering at the Urgent band: near 100%
+    // the character stands still instead of bouncing around, which reads as
+    // calm/holding-its-breath rather than jittery.
+    let frozen =
+        c.hovering || c.clicked_ticks > 0 || c.kiss > 0 || mood == Band::Urgent;
+    if mood == Band::Urgent {
+        c.moving = false;
+    }
     if !frozen {
         if c.move_ticks == 0 {
             c.moving = !c.moving;
@@ -1628,20 +1679,8 @@ fn render() {
         }
 
         let base_oy = BASE_OY * u;
-        // Panic mood adds a small horizontal shake.
-        let shake = |mood: Band| -> i32 {
-            if mood == Band::Urgent {
-                if frame % 2 == 0 {
-                    u
-                } else {
-                    -u
-                }
-            } else {
-                0
-            }
-        };
         if kind.shows_cat() {
-            let ox = (cat_snapshot.x * u as f32) as i32 + shake(cat_snapshot.mood);
+            let ox = (cat_snapshot.x * u as f32) as i32;
             let anim = anim_for(cat_snapshot.pose, frame, cat_snapshot.blink_ctr);
             draw_character(
                 bits,
@@ -1658,7 +1697,7 @@ fn render() {
             );
         }
         if kind.shows_dog() {
-            let ox = (dog_snapshot.x * u as f32) as i32 + shake(dog_snapshot.mood);
+            let ox = (dog_snapshot.x * u as f32) as i32;
             let anim = anim_for(dog_snapshot.pose, frame, dog_snapshot.blink_ctr);
             draw_character(
                 bits,
@@ -1675,7 +1714,7 @@ fn render() {
             );
         }
         if kind.shows_girl() {
-            let ox = (girl_snapshot.x * u as f32) as i32 + shake(girl_snapshot.mood);
+            let ox = (girl_snapshot.x * u as f32) as i32;
             let anim = anim_for(girl_snapshot.pose, frame, girl_snapshot.blink_ctr);
             draw_girl(
                 bits,
@@ -1957,6 +1996,7 @@ fn girl_pool(lang: LanguageId, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["もう9割っ…！", "み、見ないで〜！", "限界きちゃう！"],
             Pool::Rest => &["おつかれさま♪", "今日もがんばったね", "ひと休みしよ？"],
             Pool::Encourage => &["いい調子だよ♪", "その調子！", "まだ余裕だね"],
+            Pool::Cheer => &["そろそろ制限きちゃうかも…", "少し休んでね？", "もうすぐ上限だよ", "ひと息いれよ？"],
         },
         LanguageId::English => match pool {
             Pool::Hover => &["hi there♪", "what's up?", "you're looking?"],
@@ -1966,6 +2006,7 @@ fn girl_pool(lang: LanguageId, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["over 90%...!", "d-don't look~!", "I'm at my limit!"],
             Pool::Rest => &["nice work♪", "you did great today", "let's take a break?"],
             Pool::Encourage => &["doing great♪", "keep it up!", "still room to go"],
+            Pool::Cheer => &["the limit's close...", "take a little break?", "almost at the cap", "rest for a sec?"],
         },
         LanguageId::German => match pool {
             Pool::Hover => &["hallöchen♪", "was ist los?", "schaust du?"],
@@ -1975,6 +2016,7 @@ fn girl_pool(lang: LanguageId, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["über 90%...!", "n-nicht hinsehen~!", "ich bin am Limit!"],
             Pool::Rest => &["gut gemacht♪", "tolle Arbeit heute", "kleine Pause?"],
             Pool::Encourage => &["läuft super♪", "weiter so!", "noch genug Luft"],
+            Pool::Cheer => &["das Limit kommt...", "mach mal kurz Pause?", "fast am Limit", "kurz verschnaufen?"],
         },
         LanguageId::Dutch => match pool {
             Pool::Hover => &["hoi♪", "wat is er?", "kijk je?"],
@@ -1984,6 +2026,7 @@ fn girl_pool(lang: LanguageId, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["boven 90%...!", "n-niet kijken~!", "ik zit aan m'n grens!"],
             Pool::Rest => &["goed gedaan♪", "top vandaag", "even pauze?"],
             Pool::Encourage => &["gaat goed♪", "ga zo door!", "nog ruimte zat"],
+            Pool::Cheer => &["de limiet komt eraan...", "even pauze nemen?", "bijna op de grens", "rust even uit?"],
         },
         LanguageId::Spanish => match pool {
             Pool::Hover => &["¡holaa♪", "¿qué pasa?", "¿me miras?"],
@@ -1993,6 +2036,7 @@ fn girl_pool(lang: LanguageId, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["¡más del 90%...!", "¡n-no mires~!", "¡estoy al límite!"],
             Pool::Rest => &["¡bien hecho♪", "hoy lo hiciste genial", "¿un descanso?"],
             Pool::Encourage => &["¡vas genial♪", "¡sigue así!", "aún queda margen"],
+            Pool::Cheer => &["se acerca el límite...", "¿un descansito?", "casi al tope", "¿paramos un poco?"],
         },
         LanguageId::French => match pool {
             Pool::Hover => &["coucou♪", "qu'y a-t-il ?", "tu regardes ?"],
@@ -2002,6 +2046,7 @@ fn girl_pool(lang: LanguageId, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["plus de 90%...!", "n-ne regarde pas~!", "je suis à la limite !"],
             Pool::Rest => &["bien joué♪", "super boulot aujourd'hui", "une petite pause ?"],
             Pool::Encourage => &["ça roule♪", "continue !", "encore de la marge"],
+            Pool::Cheer => &["la limite approche...", "une petite pause ?", "presque à la limite", "souffle un peu ?"],
         },
         LanguageId::Korean => match pool {
             Pool::Hover => &["야호♪", "무슨 일이야?", "보고 있어?"],
@@ -2011,6 +2056,7 @@ fn girl_pool(lang: LanguageId, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["90% 넘었어...!", "보, 보지 마~!", "한계야!"],
             Pool::Rest => &["수고했어♪", "오늘 정말 잘했어", "좀 쉬자?"],
             Pool::Encourage => &["잘하고 있어♪", "그 기세야!", "아직 여유 있어"],
+            Pool::Cheer => &["곧 한계일지도...", "잠깐 쉬자?", "거의 상한선이야", "한숨 돌리자?"],
         },
         LanguageId::TraditionalChinese => match pool {
             Pool::Hover => &["哈囉♪", "怎麼了？", "在看我嗎？"],
@@ -2020,6 +2066,7 @@ fn girl_pool(lang: LanguageId, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["超過九成了...！", "別、別看啦～！", "快到極限了！"],
             Pool::Rest => &["辛苦了♪", "今天表現很棒", "休息一下？"],
             Pool::Encourage => &["狀態很好♪", "繼續加油！", "還有餘裕呢"],
+            Pool::Cheer => &["快到上限了喔…", "稍微休息一下吧？", "差不多到極限了", "歇口氣吧？"],
         },
     }
 }
@@ -2034,6 +2081,7 @@ fn ja_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["やばいにゃ！", "もう限界だってば！", "9割こえた、知らないよ"],
             Pool::Rest => &["…おつかれ", "ま、がんばったんじゃない", "ひと休みしたら？"],
             Pool::Encourage => &["いい調子じゃない", "まだ余裕でしょ", "ふん、悪くないね"],
+            Pool::Cheer => &["そろそろ制限だにゃ", "ちょっと休んだら？", "もう上限近いにゃ", "ひと息いれたら"],
         }
     } else {
         match pool {
@@ -2044,6 +2092,7 @@ fn ja_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["たいへんだワン！", "もうすぐ限界だよー！", "9割！きをつけて！"],
             Pool::Rest => &["きょうもがんばったね！", "おつかれさま！", "えらいぞ！"],
             Pool::Encourage => &["いい調子だワン！", "その調子その調子！", "がんばってるね！"],
+            Pool::Cheer => &["もうすぐ制限だワン！", "ちょっと休もうよ！", "上限ちかいよ！", "ひと休みしてね！"],
         }
     }
 }
@@ -2078,6 +2127,7 @@ fn en_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
             ],
             Pool::Rest => &["...good job.", "not bad, I suppose.", "go rest already."],
             Pool::Encourage => &["doing fine.", "plenty left.", "hmph, not bad."],
+            Pool::Cheer => &["...nearly capped.", "take a break, hm?", "limit's close.", "go rest already."],
         }
     } else {
         match pool {
@@ -2100,6 +2150,7 @@ fn en_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["uh oh!!", "almost maxed!!", "over 90%! careful!!"],
             Pool::Rest => &["great job today!!", "you did it!!", "so proud!!"],
             Pool::Encourage => &["doing great!!", "keep going!!", "you got this!!"],
+            Pool::Cheer => &["almost at the cap!!", "take a little break!!", "limit's close!!", "rest a bit, ok?"],
         }
     }
 }
@@ -2126,6 +2177,7 @@ fn de_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["das ist schlecht.", "fast am Limit.", "über 90%. nicht mein Problem."],
             Pool::Rest => &["...gut gemacht.", "nicht übel, schätze ich.", "ruh dich aus."],
             Pool::Encourage => &["läuft doch.", "noch genug übrig.", "pff, nicht schlecht."],
+            Pool::Cheer => &["...fast am Limit.", "mach mal Pause, hm?", "Limit ist nah.", "geh dich ausruhen."],
         }
     } else {
         match pool {
@@ -2148,6 +2200,7 @@ fn de_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["oh oh!!", "fast am Limit!!", "über 90%! vorsicht!!"],
             Pool::Rest => &["super gemacht heute!!", "geschafft!!", "so stolz!!"],
             Pool::Encourage => &["läuft super!!", "weiter so!!", "du schaffst das!!"],
+            Pool::Cheer => &["fast am Limit!!", "mach kurz Pause!!", "das Limit kommt!!", "ruh dich aus, ja?"],
         }
     }
 }
@@ -2174,6 +2227,7 @@ fn nl_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["dit is slecht.", "bijna op.", "boven 90%. niet mijn probleem."],
             Pool::Rest => &["...goed gedaan.", "niet slecht, denk ik.", "ga maar rusten."],
             Pool::Encourage => &["gaat prima.", "nog genoeg over.", "pff, niet slecht."],
+            Pool::Cheer => &["...bijna aan de limiet.", "neem even pauze?", "grens komt eraan.", "ga maar rusten."],
         }
     } else {
         match pool {
@@ -2196,6 +2250,7 @@ fn nl_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["oei oei!!", "bijna op!!", "boven 90%! pas op!!"],
             Pool::Rest => &["goed gedaan vandaag!!", "het is gelukt!!", "zo trots!!"],
             Pool::Encourage => &["gaat goed!!", "ga zo door!!", "jij kan dit!!"],
+            Pool::Cheer => &["bijna aan de limiet!!", "neem even pauze!!", "grens komt eraan!!", "rust uit, ok?"],
         }
     }
 }
@@ -2222,6 +2277,7 @@ fn es_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["esto va mal.", "casi al límite.", "más del 90%. no es mi problema."],
             Pool::Rest => &["...buen trabajo.", "no está mal, supongo.", "ve a descansar."],
             Pool::Encourage => &["vas bien.", "queda de sobra.", "bah, no está mal."],
+            Pool::Cheer => &["...casi al tope.", "haz una pausa, ¿no?", "el límite está cerca.", "ve a descansar."],
         }
     } else {
         match pool {
@@ -2244,6 +2300,7 @@ fn es_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["¡¡ay no!!", "¡¡casi al límite!!", "¡¡más del 90%! ¡cuidado!!"],
             Pool::Rest => &["¡¡buen trabajo hoy!!", "¡¡lo lograste!!", "¡¡qué orgullo!!"],
             Pool::Encourage => &["¡¡vas genial!!", "¡¡sigue así!!", "¡¡tú puedes!!"],
+            Pool::Cheer => &["¡¡casi al tope!!", "¡¡descansa un poco!!", "¡¡límite cerca!!", "¡descansa, ¿sí?!"],
         }
     }
 }
@@ -2270,6 +2327,7 @@ fn fr_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["c'est mauvais.", "presque au max.", "plus de 90%. pas mon problème."],
             Pool::Rest => &["...bien joué.", "pas mal, j'imagine.", "va te reposer."],
             Pool::Encourage => &["ça roule.", "il reste de la marge.", "pff, pas mal."],
+            Pool::Cheer => &["...presque au max.", "fais une pause, hm ?", "la limite approche.", "va te reposer."],
         }
     } else {
         match pool {
@@ -2292,6 +2350,7 @@ fn fr_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["oh oh !!", "presque au max !!", "plus de 90% ! attention !!"],
             Pool::Rest => &["bravo aujourd'hui !!", "tu as réussi !!", "trop fier !!"],
             Pool::Encourage => &["ça va super !!", "continue !!", "tu gères !!"],
+            Pool::Cheer => &["presque au max !!", "fais une petite pause !!", "limite tout près !!", "repose-toi un peu !"],
         }
     }
 }
@@ -2312,6 +2371,7 @@ fn ko_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["위험하다냥!", "거의 한계야.", "90% 넘음. 난 몰라."],
             Pool::Rest => &["...수고했어.", "뭐, 나쁘진 않네.", "이제 좀 쉬어."],
             Pool::Encourage => &["좋은데.", "아직 여유 있잖아.", "흥, 나쁘지 않네."],
+            Pool::Cheer => &["...곧 한계야.", "좀 쉬는 게 어때?", "상한선 가까워.", "이제 좀 쉬라냥."],
         }
     } else {
         match pool {
@@ -2322,6 +2382,7 @@ fn ko_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["큰일이야 멍!", "거의 한계야!", "90%! 조심해!!"],
             Pool::Rest => &["오늘도 잘했어!!", "해냈어!!", "정말 대단해!!"],
             Pool::Encourage => &["잘하고 있어!!", "그 기세야!!", "넌 할 수 있어!!"],
+            Pool::Cheer => &["곧 한계야 멍!", "조금만 쉬자!", "상한선 가까워!", "한숨 돌리자!"],
         }
     }
 }
@@ -2336,6 +2397,7 @@ fn zh_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["不妙喔。", "快到上限了。", "超過九成。不關我的事。"],
             Pool::Rest => &["...辛苦了。", "還不錯啦，我想。", "去休息吧。"],
             Pool::Encourage => &["還行啊。", "還有餘裕呢。", "哼，不賴嘛。"],
+            Pool::Cheer => &["...快到上限了喔。", "休息一下吧？", "上限就快到了。", "去歇一下啦。"],
         }
     } else {
         match pool {
@@ -2346,6 +2408,7 @@ fn zh_pool(is_cat: bool, pool: Pool) -> &'static [&'static str] {
             Pool::Urgent => &["糟糕!!", "快到上限了!!", "超過九成! 小心!!"],
             Pool::Rest => &["今天也辛苦了!!", "你做到了!!", "好驕傲!!"],
             Pool::Encourage => &["表現很好!!", "繼續加油!!", "你可以的!!"],
+            Pool::Cheer => &["快到上限了!!", "稍微休息一下!!", "上限就快到了!!", "歇口氣吧!"],
         }
     }
 }
