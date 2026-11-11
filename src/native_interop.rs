@@ -1,7 +1,6 @@
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
-use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // Window style constants
@@ -51,20 +50,11 @@ pub fn find_child_window(parent: HWND, class_name: &str) -> Option<HWND> {
     }
 }
 
-/// Get taskbar position via SHAppBarMessage
+/// Get the taskbar rectangle. GetWindowRect rather than SHAppBarMessage, which
+/// is a blocking send to Explorer (and is called with the state lock held
+/// while dragging).
 pub fn get_taskbar_rect(taskbar_hwnd: HWND) -> Option<RECT> {
-    unsafe {
-        let mut abd = APPBARDATA {
-            cbSize: std::mem::size_of::<APPBARDATA>() as u32,
-            hWnd: taskbar_hwnd,
-            ..Default::default()
-        };
-        let result = SHAppBarMessage(ABM_GETTASKBARPOS, &mut abd);
-        if result == 0 {
-            return None;
-        }
-        Some(abd.rc)
-    }
+    get_window_rect_safe(taskbar_hwnd)
 }
 
 /// Get the bounding rectangle of a window
@@ -79,15 +69,20 @@ pub fn get_window_rect_safe(hwnd: HWND) -> Option<RECT> {
     }
 }
 
-/// Embed our window as a child of the taskbar
-pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
+/// Embed our window as a child of the taskbar. Returns false if SetParent failed.
+pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) -> bool {
     unsafe {
-        // Preserve existing extended style, add tool window + no activate
+        // Preserve existing extended style, add tool window + no activate.
+        // NOPARENTNOTIFY: don't send Explorer synchronous WM_PARENTNOTIFY on
+        // destroy / click.
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
         let _ = SetWindowLongW(
             hwnd,
             GWL_EXSTYLE,
-            ex_style | WS_EX_TOOLWINDOW.0 as i32 | WS_EX_NOACTIVATE.0 as i32,
+            ex_style
+                | WS_EX_TOOLWINDOW.0 as i32
+                | WS_EX_NOACTIVATE.0 as i32
+                | WS_EX_NOPARENTNOTIFY.0 as i32,
         );
 
         // Change from popup to child
@@ -95,14 +90,18 @@ pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
         let new_style = (style & !WS_POPUP_STYLE) | WS_CHILD_STYLE | WS_CLIPSIBLINGS_STYLE;
         let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
 
+        // Judge by the resulting parent rather than SetParent's return value
+        // (the previous parent), which windows-rs turns into Err when null.
         let _ = SetParent(hwnd, taskbar_hwnd);
+        matches!(GetParent(hwnd), Ok(parent) if parent == taskbar_hwnd)
     }
 }
 
-/// Move the window
+/// Move the window and bring it to the top of its siblings (the taskbar's own
+/// content can otherwise end up above it).
 pub fn move_window(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
     unsafe {
-        let _ = MoveWindow(hwnd, x, y, w, h, true);
+        let _ = SetWindowPos(hwnd, HWND_TOP, x, y, w, h, SWP_NOACTIVATE);
     }
 }
 

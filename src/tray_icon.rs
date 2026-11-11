@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -15,6 +17,9 @@ const CODEX_TRAY_ICON_ID: u32 = 2;
 
 /// Menu item ID for toggling widget visibility (used by window.rs context menu).
 pub const IDM_TOGGLE_WIDGET: u16 = 50;
+
+/// Whether the last `sync` registered every icon it was asked to show.
+static REGISTERED: AtomicBool = AtomicBool::new(false);
 
 /// Actions the tray message handler can request from the main window.
 pub enum TrayAction {
@@ -306,6 +311,9 @@ fn load_embedded_app_icon() -> HICON {
         if extracted == 0 {
             HICON::default()
         } else if !small_icon.is_invalid() {
+            if !large_icon.is_invalid() {
+                let _ = DestroyIcon(large_icon);
+            }
             small_icon
         } else {
             large_icon
@@ -342,9 +350,13 @@ fn copy_wide_256(s: &str, buf: &mut [u16; 256]) {
     copy_wide(s, buf)
 }
 
-/// Register the tray icon with the shell.
-pub fn add(hwnd: HWND, kind: TrayIconKind, percent: Option<f64>, tooltip: &str) {
+/// Update the tray icon, registering it with the shell if it isn't yet.
+/// Returns false if the icon could not be created or registered.
+fn upsert(hwnd: HWND, kind: TrayIconKind, percent: Option<f64>, tooltip: &str) -> bool {
     let hicon = create_icon(kind, percent);
+    if hicon.is_invalid() {
+        return false;
+    }
     unsafe {
         let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
         nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
@@ -354,28 +366,10 @@ pub fn add(hwnd: HWND, kind: TrayIconKind, percent: Option<f64>, tooltip: &str) 
         nid.uCallbackMessage = WM_APP_TRAY;
         nid.hIcon = hicon;
         copy_to_tip(tooltip, &mut nid.szTip);
-        let _ = Shell_NotifyIconW(NIM_ADD, &nid);
-        if !hicon.is_invalid() {
-            let _ = DestroyIcon(hicon);
-        }
-    }
-}
-
-/// Update the tray icon colour and tooltip to reflect current usage.
-pub fn update(hwnd: HWND, kind: TrayIconKind, percent: Option<f64>, tooltip: &str) {
-    let hicon = create_icon(kind, percent);
-    unsafe {
-        let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
-        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-        nid.hWnd = hwnd;
-        nid.uID = kind.id();
-        nid.uFlags = NIF_ICON | NIF_TIP;
-        nid.hIcon = hicon;
-        copy_to_tip(tooltip, &mut nid.szTip);
-        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
-        if !hicon.is_invalid() {
-            let _ = DestroyIcon(hicon);
-        }
+        let ok = Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool()
+            || Shell_NotifyIconW(NIM_ADD, &nid).as_bool();
+        let _ = DestroyIcon(hicon);
+        ok
     }
 }
 
@@ -398,19 +392,31 @@ pub fn sync(hwnd: HWND, icons: &[TrayIconData]) {
         .iter()
         .find(|icon| matches!(icon.kind, TrayIconKind::Codex));
 
+    // Only the shown icons count; a failed remove of a hidden one is harmless.
+    let mut registered = true;
     if let Some(icon) = show_claude {
-        add(hwnd, icon.kind, icon.percent, &icon.tooltip);
-        update(hwnd, icon.kind, icon.percent, &icon.tooltip);
+        registered &= upsert(hwnd, icon.kind, icon.percent, &icon.tooltip);
     } else {
         remove(hwnd, TrayIconKind::Claude);
     }
 
     if let Some(icon) = show_codex {
-        add(hwnd, icon.kind, icon.percent, &icon.tooltip);
-        update(hwnd, icon.kind, icon.percent, &icon.tooltip);
+        registered &= upsert(hwnd, icon.kind, icon.percent, &icon.tooltip);
     } else {
         remove(hwnd, TrayIconKind::Codex);
     }
+    REGISTERED.store(registered, Ordering::Relaxed);
+}
+
+/// True when the last `sync` failed to register an icon (e.g. the shell was
+/// not ready yet), so the caller should sync again.
+pub fn needs_retry() -> bool {
+    !REGISTERED.load(Ordering::Relaxed)
+}
+
+/// Forget the registration; the icons belonged to a window that is gone.
+pub fn mark_unregistered() {
+    REGISTERED.store(false, Ordering::Relaxed);
 }
 
 pub fn remove_all(hwnd: HWND) {

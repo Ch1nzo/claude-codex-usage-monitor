@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use std::os::windows::process::CommandExt;
@@ -14,7 +15,19 @@ const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-const MODEL_FALLBACK_CHAIN: &[&str] = &["claude-3-haiku-20240307", "claude-haiku-4-5-20251001"];
+const MODEL_FALLBACK_CHAIN: &[&str] = &["claude-haiku-4-5"];
+
+/// How long to wait for `claude --version` / `where.exe` style probes.
+const CLI_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// CLI token refreshes are attempted on every poll until this many polls in a
+/// row have failed to refresh, then at most once per `CLI_REFRESH_THROTTLE`.
+const CLI_REFRESH_FREE_ATTEMPTS: u32 = 5;
+const CLI_REFRESH_THROTTLE: Duration = Duration::from_secs(15 * 60);
+/// How long after a reset time fast polling may still expect fresh data.
+const RESET_FAST_POLL_WINDOW: Duration = Duration::from_secs(120);
+
+/// (consecutive polls whose CLI refresh failed, time of the last such failure)
+static CLI_REFRESH_BACKOFF: Mutex<(u32, Option<Instant>)> = Mutex::new((0, None));
 
 #[derive(Debug)]
 pub enum PollError {
@@ -24,23 +37,29 @@ pub enum PollError {
     RequestFailed,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CredentialWatchMode {
-    ActiveSource,
-    AllSources,
-}
-
-pub type CredentialWatchSnapshot = Vec<String>;
-
 #[derive(Deserialize)]
 struct UsageResponse {
     five_hour: Option<UsageBucket>,
     seven_day: Option<UsageBucket>,
+    /// Newer response format; elements are parsed one by one so an unknown
+    /// or malformed entry doesn't fail the whole response.
+    #[serde(default)]
+    limits: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
 struct UsageBucket {
     utilization: f64,
+    resets_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UsageLimit {
+    kind: String,
+    #[serde(default)]
+    scope: Option<serde_json::Value>,
+    #[serde(alias = "utilization")]
+    percent: f64,
     resets_at: Option<String>,
 }
 
@@ -129,29 +148,77 @@ fn poll_codex() -> Result<UsageData, PollError> {
 }
 
 fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError> {
-    loop {
+    // One throttle decision and at most one recorded failure per poll, however
+    // many expired sources it walks through.
+    let may_refresh = {
+        let (failures, last_failure) = *CLI_REFRESH_BACKOFF
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        refresh_allowed(
+            failures,
+            last_failure.map_or(Duration::MAX, |at| at.elapsed()),
+        )
+    };
+    let mut attempted = false;
+
+    let result = loop {
         if !is_token_expired(creds.expires_at) {
-            return Ok(creds);
+            break Ok(creds);
         }
 
         let source = creds.source.clone();
-        cli_refresh_token(&source);
+        if may_refresh {
+            attempted = true;
+            cli_refresh_token(&source);
 
-        match read_credentials_from_source(&source) {
-            Some(refreshed) if !is_token_expired(refreshed.expires_at) => return Ok(refreshed),
-            Some(_) => diagnose::log(format!(
-                "credentials from {source:?} still expired after refresh attempt"
-            )),
-            None => diagnose::log(format!(
-                "credentials from {source:?} unavailable after refresh attempt"
-            )),
+            match read_credentials_from_source(&source) {
+                Some(refreshed) if !is_token_expired(refreshed.expires_at) => {
+                    reset_refresh_backoff();
+                    return Ok(refreshed);
+                }
+                Some(_) => diagnose::log(format!(
+                    "credentials from {source:?} still expired after refresh attempt"
+                )),
+                None => diagnose::log(format!(
+                    "credentials from {source:?} unavailable after refresh attempt"
+                )),
+            }
+        } else {
+            diagnose::log(format!(
+                "skipping CLI token refresh for {source:?}: throttled after repeated failures"
+            ));
         }
 
         match read_next_credentials_after(&source) {
             Some(next) => creds = next,
-            None => return Err(PollError::TokenExpired),
+            None => break Err(PollError::TokenExpired),
         }
+    };
+
+    // A refresh ran but produced no fresh token (even if a later source was
+    // fresh): count this poll as one failure.
+    if attempted {
+        let mut backoff = CLI_REFRESH_BACKOFF
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *backoff = (backoff.0.saturating_add(1), Some(Instant::now()));
     }
+    result
+}
+
+/// Whether a CLI token refresh may run now, given the consecutive failed polls
+/// so far and the time since the last failure. Keeps a logged-out machine from
+/// launching `claude -p .` on every poll.
+fn refresh_allowed(failures: u32, since_last: Duration) -> bool {
+    failures < CLI_REFRESH_FREE_ATTEMPTS || since_last >= CLI_REFRESH_THROTTLE
+}
+
+/// Forget earlier refresh failures (on success, or when the user asks for a
+/// manual refresh).
+pub fn reset_refresh_backoff() {
+    *CLI_REFRESH_BACKOFF
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = (0, None);
 }
 
 /// Invoke the Claude CLI with a minimal prompt to force its internal
@@ -328,24 +395,29 @@ fn wait_for_refresh(child: &mut std::process::Child) {
 /// Resolve the full path to the `claude` CLI executable.
 fn resolve_windows_claude_path() -> String {
     for name in &["claude.cmd", "claude"] {
-        if Command::new(name)
-            .arg("--version")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
+        if run_with_timeout(
+            Command::new(name)
+                .arg("--version")
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+            CLI_PROBE_TIMEOUT,
+        )
+        .is_some()
         {
             return name.to_string();
         }
     }
 
     for name in &["claude.cmd", "claude"] {
-        if let Ok(output) = Command::new("where.exe")
-            .arg(name)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
+        if let Some(output) = run_with_timeout(
+            Command::new("where.exe")
+                .arg(name)
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null()),
+            CLI_PROBE_TIMEOUT,
+        ) {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 if let Some(first_line) = stdout.lines().next() {
@@ -363,24 +435,29 @@ fn resolve_windows_claude_path() -> String {
 
 fn resolve_windows_codex_path() -> String {
     for name in &["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
-        if Command::new(name)
-            .arg("--version")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
+        if run_with_timeout(
+            Command::new(name)
+                .arg("--version")
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+            CLI_PROBE_TIMEOUT,
+        )
+        .is_some()
         {
             return name.to_string();
         }
     }
 
     for name in &["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
-        if let Ok(output) = Command::new("where.exe")
-            .arg(name)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
+        if let Some(output) = run_with_timeout(
+            Command::new("where.exe")
+                .arg(name)
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null()),
+            CLI_PROBE_TIMEOUT,
+        ) {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 if let Some(first_line) = stdout.lines().next() {
@@ -404,34 +481,6 @@ fn build_agent() -> Result<ureq::Agent, PollError> {
         .build())
 }
 
-pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSnapshot {
-    let sources = match mode {
-        CredentialWatchMode::ActiveSource => read_first_credentials()
-            .map(|creds| vec![creds.source])
-            .unwrap_or_else(all_known_credential_sources),
-        CredentialWatchMode::AllSources => all_known_credential_sources(),
-    };
-
-    let mut snapshot: CredentialWatchSnapshot = sources
-        .into_iter()
-        .filter_map(|source| credential_watch_signature(&source))
-        .collect();
-    snapshot.sort();
-    snapshot.dedup();
-    snapshot
-}
-
-fn all_known_credential_sources() -> Vec<CredentialSource> {
-    let mut sources = Vec::new();
-    if let Some(source) = windows_credential_source() {
-        sources.push(source);
-    }
-    for distro in list_wsl_distros() {
-        sources.push(CredentialSource::Wsl { distro });
-    }
-    sources
-}
-
 fn windows_credential_source() -> Option<CredentialSource> {
     let home = dirs::home_dir()?;
     Some(CredentialSource::Windows(
@@ -439,63 +488,15 @@ fn windows_credential_source() -> Option<CredentialSource> {
     ))
 }
 
-fn credential_watch_signature(source: &CredentialSource) -> Option<String> {
-    match source {
-        CredentialSource::Windows(path) => Some(windows_credential_watch_signature(path)),
-        CredentialSource::Wsl { distro } => wsl_credential_watch_signature(distro),
-    }
-}
-
-fn windows_credential_watch_signature(path: &PathBuf) -> String {
-    let key = format!("win:{}", path.display());
-    match std::fs::metadata(path) {
-        Ok(metadata) => {
-            let modified = metadata
-                .modified()
-                .ok()
-                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-                .map(|value| value.as_secs())
-                .unwrap_or(0);
-            format!("{key}|present|{}|{modified}", metadata.len())
-        }
-        Err(_) => format!("{key}|missing"),
-    }
-}
-
-fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
-    let output = run_with_timeout(
-        Command::new("wsl.exe")
-            .arg("-d")
-            .arg(distro)
-            .arg("--")
-            .arg("sh")
-            .arg("-lc")
-            .arg(
-                "if [ -f ~/.claude/.credentials.json ]; then \
-                 stat -c 'present|%s|%Y' ~/.claude/.credentials.json; \
-                 else echo missing; fi",
-            )
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null()),
-        Duration::from_secs(5),
-    )?;
-
-    let state = if output.status.success() {
-        decode_wsl_text(&output.stdout).trim().to_string()
-    } else {
-        format!("status-{}", output.status)
-    };
-
-    Some(format!("wsl:{distro}|{state}"))
-}
-
 fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
     // Try the dedicated usage endpoint first
     match try_usage_endpoint(token)? {
         Some(data) => {
-            // If reset timers are missing, fill them in from the Messages API
-            if data.session.resets_at.is_none() || data.weekly.resets_at.is_none() {
+            // If reset timers are missing, fill them in from the Messages API —
+            // but only for a window already in use: the request itself would
+            // otherwise start a new 5-hour window.
+            let needs_reset = |s: &UsageSection| s.resets_at.is_none() && s.percentage > 0.0;
+            if needs_reset(&data.session) || needs_reset(&data.weekly) {
                 if let Ok(fallback) = fetch_usage_via_messages(token) {
                     let mut merged = data;
                     if merged.session.resets_at.is_none() {
@@ -529,33 +530,88 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
         .set("anthropic-beta", "oauth-2025-04-20")
         .call()
     {
-        Ok(resp) => resp,
+        Ok(resp) => {
+            diagnose::log(format!("usage endpoint returned status {}", resp.status()));
+            resp
+        }
         Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
             diagnose::log(format!(
                 "usage endpoint returned auth error status {code}; re-login required"
             ));
             return Err(PollError::AuthRequired);
         }
-        Err(_) => return Ok(None),
+        // Rate limited / server trouble: retry later rather than spending a
+        // real Messages API request on every poll.
+        Err(ureq::Error::Status(code, _)) if code == 429 || code >= 500 => {
+            diagnose::log(format!(
+                "usage endpoint returned status {code}; retrying later"
+            ));
+            return Err(PollError::RequestFailed);
+        }
+        Err(ureq::Error::Status(code, _)) => {
+            diagnose::log(format!(
+                "usage endpoint returned status {code}; falling back to Messages API"
+            ));
+            return Ok(None);
+        }
+        Err(ureq::Error::Transport(error)) => {
+            diagnose::log_error("usage endpoint request failed", error);
+            return Err(PollError::RequestFailed);
+        }
     };
 
     let response: UsageResponse = match resp.into_json() {
         Ok(response) => response,
-        Err(_) => return Ok(None),
+        Err(error) => {
+            diagnose::log_error("unable to parse usage response", error);
+            return Ok(None);
+        }
     };
-    let mut data = UsageData::default();
+    let data = usage_from_response(response);
+    if data.is_none() {
+        diagnose::log("usage response had no recognizable limits; falling back to Messages API");
+    }
+    Ok(data)
+}
 
-    if let Some(bucket) = &response.five_hour {
-        data.session.percentage = bucket.utilization;
-        data.session.resets_at = parse_iso8601(bucket.resets_at.as_deref());
+/// Build usage data from the legacy `five_hour` / `seven_day` fields, falling
+/// back to the unscoped `session` / `weekly_all` entries of `limits` for any
+/// legacy field that is missing. None if neither window is present.
+fn usage_from_response(response: UsageResponse) -> Option<UsageData> {
+    let from_bucket = |bucket: UsageBucket| UsageSection {
+        percentage: bucket.utilization,
+        resets_at: parse_iso8601(bucket.resets_at.as_deref()),
+    };
+    let mut session = response.five_hour.map(from_bucket);
+    let mut weekly = response.seven_day.map(from_bucket);
+
+    for value in response.limits {
+        let Ok(limit) = serde_json::from_value::<UsageLimit>(value) else {
+            continue;
+        };
+        if limit.scope.is_some() {
+            continue;
+        }
+        let slot = match limit.kind.as_str() {
+            "session" => &mut session,
+            "weekly_all" => &mut weekly,
+            _ => continue,
+        };
+        if slot.is_none() {
+            *slot = Some(UsageSection {
+                percentage: limit.percent,
+                resets_at: parse_iso8601(limit.resets_at.as_deref()),
+            });
+        }
     }
 
-    if let Some(bucket) = &response.seven_day {
-        data.weekly.percentage = bucket.utilization;
-        data.weekly.resets_at = parse_iso8601(bucket.resets_at.as_deref());
+    if session.is_none() && weekly.is_none() {
+        return None;
     }
-
-    Ok(Some(data))
+    Some(UsageData {
+        session: session.unwrap_or_default(),
+        weekly: weekly.unwrap_or_default(),
+    })
 }
 
 fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
@@ -894,7 +950,9 @@ fn list_wsl_distros() -> Vec<String> {
     stdout
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
+        // Docker Desktop's internal distros never hold Claude credentials;
+        // probing them just starts them.
+        .filter(|line| !line.is_empty() && !line.starts_with("docker-desktop"))
         .map(ToOwned::to_owned)
         .collect()
 }
@@ -1177,14 +1235,117 @@ fn time_until_display_change_from_secs(total_secs: u64, detailed: bool) -> Durat
     Duration::from_secs(total_secs.saturating_sub(current_bucket_start) + 1)
 }
 
-/// Returns true if either section has reached "now" (reset time has passed).
+/// Returns true if either section's reset time passed within the last
+/// `RESET_FAST_POLL_WINDOW`. Older resets mean the server hasn't rolled the
+/// window over, so fast polling for it would never end.
 pub fn is_past_reset(data: &UsageData) -> bool {
     let now = SystemTime::now();
-    let past = |s: &UsageSection| matches!(s.resets_at, Some(t) if now.duration_since(t).is_ok());
+    let past = |s: &UsageSection| {
+        s.resets_at
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|elapsed| elapsed <= RESET_FAST_POLL_WINDOW)
+    };
     past(&data.session) || past(&data.weekly)
 }
 
 pub fn app_is_past_reset(data: &AppUsageData) -> bool {
     data.claude_code.as_ref().is_some_and(is_past_reset)
         || data.codex.as_ref().is_some_and(is_past_reset)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn usage(json: &str) -> Option<UsageData> {
+        usage_from_response(serde_json::from_str(json).expect("test JSON parses"))
+    }
+
+    fn resets_at(offset_from_now: Duration, past: bool) -> UsageData {
+        let now = SystemTime::now();
+        let at = if past {
+            now - offset_from_now
+        } else {
+            now + offset_from_now
+        };
+        UsageData {
+            session: UsageSection {
+                percentage: 0.0,
+                resets_at: Some(at),
+            },
+            weekly: UsageSection::default(),
+        }
+    }
+
+    #[test]
+    fn usage_from_legacy_fields() {
+        let data = usage(
+            r#"{"five_hour":{"utilization":12.5,"resets_at":"2026-01-01T05:00:00+00:00"},
+                "seven_day":{"utilization":40.0,"resets_at":null}}"#,
+        )
+        .expect("legacy fields are recognized");
+        assert_eq!(data.session.percentage, 12.5);
+        assert_eq!(
+            data.session.resets_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1_767_243_600))
+        );
+        assert_eq!(data.weekly.percentage, 40.0);
+        assert_eq!(data.weekly.resets_at, None);
+    }
+
+    #[test]
+    fn usage_from_limits_array() {
+        let data = usage(
+            r#"{"limits":[
+                {"kind":"session","scope":{"model":"opus"},"percent":99.0},
+                {"kind":"session","scope":null,"percent":7.0,"resets_at":"2026-01-01T05:00:00Z"},
+                {"kind":"weekly_all","percent":"broken"},
+                {"kind":"weekly_all","utilization":33.0},
+                {"kind":"something_else","percent":1.0}
+            ]}"#,
+        )
+        .expect("limits are recognized");
+        assert_eq!(data.session.percentage, 7.0);
+        assert_eq!(
+            data.session.resets_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1_767_243_600))
+        );
+        assert_eq!(data.weekly.percentage, 33.0);
+        assert_eq!(data.weekly.resets_at, None);
+
+        // Legacy fields win; limits only fill what is missing.
+        let mixed = usage(
+            r#"{"five_hour":{"utilization":10.0,"resets_at":null},
+                "limits":[{"kind":"session","percent":50.0},{"kind":"weekly_all","percent":20.0}]}"#,
+        )
+        .expect("mixed response is recognized");
+        assert_eq!(mixed.session.percentage, 10.0);
+        assert_eq!(mixed.weekly.percentage, 20.0);
+    }
+
+    #[test]
+    fn usage_from_response_without_limits_is_none() {
+        assert!(usage("{}").is_none());
+        assert!(usage(r#"{"five_hour":null,"seven_day":null,"limits":[]}"#).is_none());
+        assert!(usage(r#"{"limits":[{"kind":"session","scope":"x","percent":5.0}]}"#).is_none());
+    }
+
+    #[test]
+    fn is_past_reset_only_shortly_after_reset() {
+        assert!(is_past_reset(&resets_at(Duration::from_secs(1), true)));
+        assert!(is_past_reset(&resets_at(Duration::from_secs(115), true)));
+        assert!(!is_past_reset(&resets_at(Duration::from_secs(125), true)));
+        assert!(!is_past_reset(&resets_at(Duration::from_secs(60), false)));
+        assert!(!is_past_reset(&UsageData::default()));
+    }
+
+    #[test]
+    fn refresh_allowed_throttles_after_repeated_failures() {
+        assert!(refresh_allowed(0, Duration::ZERO));
+        assert!(refresh_allowed(4, Duration::ZERO));
+        assert!(!refresh_allowed(5, Duration::from_secs(60)));
+        assert!(!refresh_allowed(10, Duration::from_secs(14 * 60)));
+        assert!(refresh_allowed(5, Duration::from_secs(15 * 60)));
+        assert!(refresh_allowed(u32::MAX, Duration::MAX));
+    }
 }

@@ -14,8 +14,7 @@ pub fn init() -> Result<PathBuf, String> {
     let path = std::env::temp_dir().join("claude-codex-usage-monitor.log");
     let file = OpenOptions::new()
         .create(true)
-        .write(true)
-        .truncate(true)
+        .append(true)
         .open(&path)
         .map_err(|e| format!("Unable to open diagnostic log file {}: {e}", path.display()))?;
 

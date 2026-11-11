@@ -72,9 +72,11 @@ struct AppState {
     poll_interval_ms: u32,
     retry_count: u32,
     force_notify_auth_error: bool,
-    auth_error_paused_polling: bool,
-    auth_watch_mode: poller::CredentialWatchMode,
-    auth_watch_snapshot: poller::CredentialWatchSnapshot,
+    last_error_is_auth: bool,
+    /// Auth-type errors since the last successful poll.
+    auth_failures: u32,
+    /// A re-login balloon was shown since the last successful poll.
+    auth_notified: bool,
     last_poll_ok: bool,
     update_status: UpdateStatus,
     last_update_check_unix: Option<u64>,
@@ -97,6 +99,14 @@ enum UpdateStatus {
 }
 
 const RETRY_BASE_MS: u32 = 30_000; // 30 seconds
+/// Auth errors back off to at least this (or the poll interval, if longer).
+const AUTH_RETRY_CAP_MS: u32 = POLL_5_MIN;
+/// Expired / missing credentials are announced once this many auth-type errors
+/// occur without a successful poll (one failure at boot is usually just the CLI
+/// refresh timing out).
+const AUTH_NOTIFY_AFTER_FAILURES: u32 = 4;
+const WATCHDOG_INTERVAL_MS: u32 = 3_000;
+const WINDOW_CLASS_NAME: &str = "ClaudeCodexUsageMonitor";
 
 const POLL_1_MIN: u32 = 60_000;
 const POLL_5_MIN: u32 = 300_000;
@@ -155,6 +165,13 @@ const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 
 static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Set right before the widget is destroyed on purpose. Any other WM_DESTROY
+/// means the taskbar took the widget with it, and the watchdog re-creates it.
+static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// (poll running, rerun requested): at most one poll worker at a time.
+static POLL: Mutex<(bool, bool)> = Mutex::new((false, false));
 
 /// Current system DPI (96 = 100% scaling, 144 = 150%, 192 = 200%, etc.)
 static CURRENT_DPI: AtomicU32 = AtomicU32::new(96);
@@ -733,33 +750,35 @@ fn set_window_title(hwnd: HWND, strings: Strings) {
     }
 }
 
-fn show_info_message(hwnd: HWND, title: &str, message: &str) {
+// Message boxes have no owner: an owner inside the taskbar would disable the
+// taskbar while the box is open. Topmost/foreground so they aren't lost.
+fn show_info_message(title: &str, message: &str) {
     unsafe {
         let title_wide = native_interop::wide_str(title);
         let message_wide = native_interop::wide_str(message);
         let _ = MessageBoxW(
-            hwnd,
+            HWND::default(),
             PCWSTR::from_raw(message_wide.as_ptr()),
             PCWSTR::from_raw(title_wide.as_ptr()),
-            MB_OK | MB_ICONINFORMATION,
+            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST,
         );
     }
 }
 
-fn show_error_message(hwnd: HWND, title: &str, message: &str) {
+fn show_error_message(title: &str, message: &str) {
     unsafe {
         let title_wide = native_interop::wide_str(title);
         let message_wide = native_interop::wide_str(message);
         let _ = MessageBoxW(
-            hwnd,
+            HWND::default(),
             PCWSTR::from_raw(message_wide.as_ptr()),
             PCWSTR::from_raw(title_wide.as_ptr()),
-            MB_OK | MB_ICONERROR,
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
         );
     }
 }
 
-fn show_update_prompt(hwnd: HWND, strings: Strings, release: &ReleaseDescriptor) -> bool {
+fn show_update_prompt(strings: Strings, release: &ReleaseDescriptor) -> bool {
     let message = strings
         .update_prompt_now
         .replace("{version}", &release.latest_version);
@@ -768,10 +787,10 @@ fn show_update_prompt(hwnd: HWND, strings: Strings, release: &ReleaseDescriptor)
         let title_wide = native_interop::wide_str(strings.update_available);
         let message_wide = native_interop::wide_str(&message);
         MessageBoxW(
-            hwnd,
+            HWND::default(),
             PCWSTR::from_raw(message_wide.as_ptr()),
             PCWSTR::from_raw(title_wide.as_ptr()),
-            MB_YESNO | MB_ICONQUESTION,
+            MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST,
         ) == IDYES
     }
 }
@@ -830,34 +849,35 @@ fn version_action_label(
     }
 }
 
-fn begin_update_check(hwnd: HWND, interactive: bool) {
-    let send_hwnd = SendHwnd::from_hwnd(hwnd);
-    let (strings, install_channel) = {
+fn begin_update_check(interactive: bool) {
+    let (strings, install_channel, busy) = {
         let mut state = lock_state();
         let Some(app_state) = state.as_mut() else {
             return;
         };
 
-        if matches!(
+        let busy = matches!(
             app_state.update_status,
             UpdateStatus::Checking | UpdateStatus::Applying
-        ) {
-            if interactive {
-                show_info_message(
-                    hwnd,
-                    app_state.language.strings().updates,
-                    app_state.language.strings().update_in_progress,
-                );
-            }
-            return;
+        );
+        if !busy {
+            app_state.update_status = UpdateStatus::Checking;
         }
-
-        app_state.update_status = UpdateStatus::Checking;
-        (app_state.language.strings(), app_state.install_channel)
+        (
+            app_state.language.strings(),
+            app_state.install_channel,
+            busy,
+        )
     };
+    // Show the message only after the state lock is released.
+    if busy {
+        if interactive {
+            show_info_message(strings.updates, strings.update_in_progress);
+        }
+        return;
+    }
 
     std::thread::spawn(move || {
-        let hwnd = send_hwnd.to_hwnd();
         let checked_at = now_unix_secs();
         match updater::check_for_updates() {
             Ok(UpdateCheckResult::UpToDate) => {
@@ -870,11 +890,9 @@ fn begin_update_check(hwnd: HWND, interactive: bool) {
                 }
                 save_state_settings();
                 if interactive {
-                    show_info_message(hwnd, strings.updates, strings.up_to_date);
+                    show_info_message(strings.updates, strings.up_to_date);
                 }
-                unsafe {
-                    let _ = PostMessageW(hwnd, WM_APP_UPDATE_CHECK_COMPLETE, WPARAM(0), LPARAM(0));
-                }
+                post_to_widget(WM_APP_UPDATE_CHECK_COMPLETE);
             }
             Ok(UpdateCheckResult::Available(release)) => {
                 {
@@ -885,15 +903,13 @@ fn begin_update_check(hwnd: HWND, interactive: bool) {
                     }
                 }
                 save_state_settings();
-                if interactive && show_update_prompt(hwnd, strings, &release) {
+                if interactive && show_update_prompt(strings, &release) {
                     match install_channel {
-                        InstallChannel::Portable => begin_update_apply(hwnd, release),
-                        InstallChannel::Winget => begin_winget_update(hwnd),
+                        InstallChannel::Portable => begin_update_apply(release),
+                        InstallChannel::Winget => begin_winget_update(),
                     }
                 }
-                unsafe {
-                    let _ = PostMessageW(hwnd, WM_APP_UPDATE_CHECK_COMPLETE, WPARAM(0), LPARAM(0));
-                }
+                post_to_widget(WM_APP_UPDATE_CHECK_COMPLETE);
             }
             Err(error) => {
                 {
@@ -906,64 +922,53 @@ fn begin_update_check(hwnd: HWND, interactive: bool) {
                 save_state_settings();
                 if interactive {
                     let message = format!("{}.\n\n{}", strings.update_failed, error);
-                    show_error_message(hwnd, strings.updates, &message);
+                    show_error_message(strings.updates, &message);
                 }
-                unsafe {
-                    let _ = PostMessageW(hwnd, WM_APP_UPDATE_CHECK_COMPLETE, WPARAM(0), LPARAM(0));
-                }
+                post_to_widget(WM_APP_UPDATE_CHECK_COMPLETE);
             }
         }
     });
 }
 
-fn begin_update_apply(hwnd: HWND, release: ReleaseDescriptor) {
-    let send_hwnd = SendHwnd::from_hwnd(hwnd);
-    let strings = {
+fn begin_update_apply(release: ReleaseDescriptor) {
+    let (strings, busy) = {
         let mut state = lock_state();
         let Some(app_state) = state.as_mut() else {
             return;
         };
 
-        if matches!(
+        let busy = matches!(
             app_state.update_status,
             UpdateStatus::Checking | UpdateStatus::Applying
-        ) {
-            show_info_message(
-                hwnd,
-                app_state.language.strings().updates,
-                app_state.language.strings().update_in_progress,
-            );
-            return;
+        );
+        if !busy {
+            app_state.update_status = UpdateStatus::Applying;
         }
-
-        app_state.update_status = UpdateStatus::Applying;
-        app_state.language.strings()
+        (app_state.language.strings(), busy)
     };
+    // Show the message only after the state lock is released.
+    if busy {
+        show_info_message(strings.updates, strings.update_in_progress);
+        return;
+    }
 
-    std::thread::spawn(move || {
-        let hwnd = send_hwnd.to_hwnd();
-        match updater::begin_self_update(&release) {
-            Ok(()) => unsafe {
-                let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
-            },
-            Err(error) => {
-                {
-                    let mut state = lock_state();
-                    if let Some(s) = state.as_mut() {
-                        s.update_status = UpdateStatus::Available(release);
-                    }
-                }
-                let message = format!("{}.\n\n{}", strings.update_failed, error);
-                show_error_message(hwnd, strings.updates, &message);
-                unsafe {
-                    let _ = PostMessageW(hwnd, WM_APP_UPDATE_CHECK_COMPLETE, WPARAM(0), LPARAM(0));
+    std::thread::spawn(move || match updater::begin_self_update(&release) {
+        Ok(()) => exit_for_update(),
+        Err(error) => {
+            {
+                let mut state = lock_state();
+                if let Some(s) = state.as_mut() {
+                    s.update_status = UpdateStatus::Available(release);
                 }
             }
+            let message = format!("{}.\n\n{}", strings.update_failed, error);
+            show_error_message(strings.updates, &message);
+            post_to_widget(WM_APP_UPDATE_CHECK_COMPLETE);
         }
     });
 }
 
-fn begin_winget_update(hwnd: HWND) {
+fn begin_winget_update() {
     let strings = {
         let state = lock_state();
         state.as_ref().map(|s| s.language.strings())
@@ -971,13 +976,19 @@ fn begin_winget_update(hwnd: HWND) {
     .unwrap_or(LanguageId::English.strings());
 
     match updater::begin_winget_update() {
-        Ok(()) => unsafe {
-            let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
-        },
+        Ok(()) => exit_for_update(),
         Err(error) => {
             let message = format!("{}.\n\n{}", strings.update_failed, error);
-            show_error_message(hwnd, strings.updates, &message);
+            show_error_message(strings.updates, &message);
         }
+    }
+}
+
+/// Make the app exit so the update helper (waiting on our PID) can proceed.
+fn exit_for_update() {
+    if !post_to_widget(WM_CLOSE) {
+        diagnose::log("no widget to close; exiting directly for update");
+        std::process::exit(0);
     }
 }
 
@@ -1232,8 +1243,8 @@ pub fn run() {
     }
     diagnose::log("window::run started");
 
-    // Single-instance guard: silently exit if another instance is running
-    let mutex_name = native_interop::wide_str("Global\\ClaudeCodexUsageMonitor");
+    // Single-instance guard (per session): silently exit if another instance is running
+    let mutex_name = native_interop::wide_str("Local\\ClaudeCodexUsageMonitor");
     let _mutex = unsafe {
         let handle = CreateMutexW(None, false, PCWSTR::from_raw(mutex_name.as_ptr()));
         match handle {
@@ -1254,10 +1265,10 @@ pub fn run() {
         }
     };
 
-    let class_name = native_interop::wide_str("ClaudeCodexUsageMonitor");
+    let class_name = native_interop::wide_str(WINDOW_CLASS_NAME);
 
     unsafe {
-        let hinstance = GetModuleHandleW(PCWSTR::null()).unwrap();
+        let hinstance = GetModuleHandleW(PCWSTR::null()).unwrap_or_default();
         let (large_icon, small_icon) = load_embedded_app_icons();
 
         let wc = WNDCLASSEXW {
@@ -1300,56 +1311,14 @@ pub fn run() {
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
 
-        // Create as layered popup (will be reparented into taskbar)
-        let title = native_interop::wide_str(language.strings().window_title);
-        let initial_model_count =
-            active_model_count(settings.show_claude_code, settings.show_codex);
-        let hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
-            PCWSTR::from_raw(class_name.as_ptr()),
-            PCWSTR::from_raw(title.as_ptr()),
-            WS_POPUP,
-            0,
-            0,
-            total_widget_width_for(initial_model_count),
-            sc(WIDGET_HEIGHT),
-            HWND::default(),
-            HMENU::default(),
-            hinstance,
-            None,
-        )
-        .unwrap();
-
-        if !large_icon.is_invalid() {
-            let _ = SendMessageW(
-                hwnd,
-                WM_SETICON,
-                WPARAM(ICON_BIG as usize),
-                LPARAM(large_icon.0 as isize),
-            );
-        }
-        if !small_icon.is_invalid() {
-            let _ = SendMessageW(
-                hwnd,
-                WM_SETICON,
-                WPARAM(ICON_SMALL as usize),
-                LPARAM(small_icon.0 as isize),
-            );
-        }
-
-        diagnose::log(format!("main window created hwnd={:?}", hwnd));
-
-        let is_dark = theme::is_dark_mode();
-        let mut embedded = false;
-
         {
             let mut state = lock_state();
             *state = Some(AppState {
-                hwnd: SendHwnd::from_hwnd(hwnd),
+                hwnd: SendHwnd::from_hwnd(HWND::default()),
                 taskbar_hwnd: None,
                 tray_notify_hwnd: None,
                 win_event_hook: None,
-                is_dark,
+                is_dark: theme::is_dark_mode(),
                 embedded: false,
                 language_override,
                 language,
@@ -1368,9 +1337,9 @@ pub fn run() {
                 poll_interval_ms: settings.poll_interval_ms,
                 retry_count: 0,
                 force_notify_auth_error: false,
-                auth_error_paused_polling: false,
-                auth_watch_mode: poller::CredentialWatchMode::ActiveSource,
-                auth_watch_snapshot: Vec::new(),
+                last_error_is_auth: false,
+                auth_failures: 0,
+                auth_notified: false,
                 last_poll_ok: false,
                 update_status: UpdateStatus::Idle,
                 last_update_check_unix: settings.last_update_check_unix,
@@ -1382,101 +1351,42 @@ pub fn run() {
             });
         }
 
-        // Try to embed in taskbar
-        if let Some(taskbar_hwnd) = native_interop::find_taskbar() {
-            diagnose::log(format!("taskbar found hwnd={:?}", taskbar_hwnd));
-            native_interop::embed_in_taskbar(hwnd, taskbar_hwnd);
-            embedded = true;
-
-            let mut state = lock_state();
-            let s = state.as_mut().unwrap();
-            s.taskbar_hwnd = Some(taskbar_hwnd);
-            s.embedded = true;
-
-            let tray_notify = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd");
-            s.tray_notify_hwnd = tray_notify;
-            if tray_notify.is_some() {
-                diagnose::log("TrayNotifyWnd found");
-            } else {
-                diagnose::log("TrayNotifyWnd not found");
-            }
-
-            if let Some(tray_hwnd) = tray_notify {
-                let thread_id = native_interop::get_window_thread_id(tray_hwnd);
-                let hook = native_interop::set_tray_event_hook(thread_id, on_tray_location_changed);
-                s.win_event_hook = hook;
-                if hook.is_some() {
-                    diagnose::log("tray event hook installed");
-                } else {
-                    diagnose::log("tray event hook could not be installed");
-                }
-            }
-        } else {
-            diagnose::log("taskbar not found; using fallback popup window");
+        if !create_widget() {
+            diagnose::log("widget not created at startup; watchdog will retry");
         }
-
-        // If not embedded, fall back to topmost popup with SetLayeredWindowAttributes
-        if !embedded {
-            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
-            let _ = SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
-        }
-
-        // Register system tray icon(s)
-        sync_tray_icons(hwnd);
-
-        // Position and show (only if widget_visible preference is true)
-        position_at_taskbar();
-        if settings.widget_visible {
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        }
-        diagnose::log("window shown");
-
-        // Initial render via UpdateLayeredWindow (for embedded) or InvalidateRect (fallback)
-        render_layered();
 
         // Initialize the pixel character window (floats above the widget).
+        // Created once; it follows a re-created widget via position_at_taskbar.
         let character_kind = settings
             .character_kind
             .as_deref()
             .and_then(CharacterKind::from_code)
             .unwrap_or(CharacterKind::Cat);
-        if let Some(anchor) = native_interop::get_window_rect_safe(hwnd) {
-            character::init(
-                anchor,
-                settings.characters_enabled,
-                character_kind,
-                settings.cat_variant,
-                settings.dog_variant,
-                language,
-            );
+        let widget = current_widget_hwnd();
+        let anchor = if widget.is_invalid() {
+            RECT::default()
+        } else {
+            native_interop::get_window_rect_safe(widget).unwrap_or_default()
+        };
+        character::init(
+            anchor,
+            settings.characters_enabled,
+            character_kind,
+            settings.cat_variant,
+            settings.dog_variant,
+            language,
+        );
+
+        // A thread timer without TIMERPROC: it is handled in the message loop
+        // below, so it never fires inside a menu or MessageBox modal loop.
+        let watchdog_timer = SetTimer(HWND::default(), 0, WATCHDOG_INTERVAL_MS, None);
+        if watchdog_timer == 0 {
+            diagnose::log("unable to create watchdog timer");
         }
 
-        // Poll timer: 15 minutes
-        let initial_poll_ms = {
-            let state = lock_state();
-            state
-                .as_ref()
-                .map(|s| s.poll_interval_ms)
-                .unwrap_or(POLL_15_MIN)
-        };
-        SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
-
         // Initial poll
-        let send_hwnd = SendHwnd::from_hwnd(hwnd);
-        std::thread::spawn(move || {
-            diagnose::log("initial poll thread started");
-            do_poll(send_hwnd);
-        });
+        spawn_poll(false);
 
-        schedule_auto_update_check(hwnd);
         let should_check_updates = {
             let state = lock_state();
             state
@@ -1485,19 +1395,209 @@ pub fn run() {
                 .unwrap_or(false)
         };
         if should_check_updates {
-            begin_update_check(hwnd, false);
+            begin_update_check(false);
         }
 
         // Initial theme check
         check_theme_change();
 
-        // Message loop
+        // Message loop. It outlives any one widget window and only ends on an
+        // explicit exit (WM_DESTROY with EXIT_REQUESTED posts WM_QUIT).
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
+            if msg.hwnd.is_invalid()
+                && msg.message == WM_TIMER
+                && watchdog_timer != 0
+                && msg.wParam.0 == watchdog_timer
+            {
+                watchdog();
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
+}
+
+/// Create the widget and embed it in the taskbar. Returns false, leaving no
+/// widget, when there is no taskbar yet or a step fails; the watchdog retries.
+fn create_widget() -> bool {
+    let Some(taskbar_hwnd) = native_interop::find_taskbar() else {
+        return false;
+    };
+    let (title, model_count, widget_visible) = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else {
+            return false;
+        };
+        (
+            s.language.strings().window_title,
+            active_model_count(s.show_claude_code, s.show_codex),
+            s.widget_visible,
+        )
+    };
+
+    let hwnd = unsafe {
+        let hinstance = GetModuleHandleW(PCWSTR::null()).unwrap_or_default();
+        let class_name = native_interop::wide_str(WINDOW_CLASS_NAME);
+        let title_wide = native_interop::wide_str(title);
+        // Create as layered popup (reparented into the taskbar below)
+        match CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
+            PCWSTR::from_raw(class_name.as_ptr()),
+            PCWSTR::from_raw(title_wide.as_ptr()),
+            WS_POPUP,
+            0,
+            0,
+            total_widget_width_for(model_count),
+            sc(WIDGET_HEIGHT),
+            HWND::default(),
+            HMENU::default(),
+            hinstance,
+            None,
+        ) {
+            Ok(hwnd) => hwnd,
+            Err(error) => {
+                diagnose::log_error("unable to create widget window", error);
+                return false;
+            }
+        }
+    };
+    diagnose::log(format!("main window created hwnd={:?}", hwnd));
+
+    if !native_interop::embed_in_taskbar(hwnd, taskbar_hwnd) {
+        diagnose::log(format!(
+            "unable to embed widget in taskbar hwnd={:?}; destroying it",
+            taskbar_hwnd
+        ));
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+        return false;
+    }
+    diagnose::log(format!(
+        "widget embedded in taskbar hwnd={:?}",
+        taskbar_hwnd
+    ));
+
+    let tray_notify = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd");
+    let mut hook = None;
+    if let Some(tray_hwnd) = tray_notify {
+        diagnose::log("TrayNotifyWnd found");
+        let thread_id = native_interop::get_window_thread_id(tray_hwnd);
+        hook = native_interop::set_tray_event_hook(thread_id, on_tray_location_changed);
+        if hook.is_some() {
+            diagnose::log("tray event hook installed");
+        } else {
+            diagnose::log("tray event hook could not be installed");
+        }
+    } else {
+        diagnose::log("TrayNotifyWnd not found");
+    }
+
+    let is_dark = theme::is_dark_mode();
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.hwnd = SendHwnd::from_hwnd(hwnd);
+            s.taskbar_hwnd = Some(taskbar_hwnd);
+            s.tray_notify_hwnd = tray_notify;
+            s.win_event_hook = hook;
+            s.embedded = true;
+            s.is_dark = is_dark;
+            s.dragging = false;
+        }
+    }
+
+    // Register system tray icon(s)
+    sync_tray_icons(hwnd);
+
+    // Position and show (only if widget_visible preference is true)
+    position_at_taskbar();
+    if widget_visible {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+    }
+    render_layered();
+
+    let poll_delay = lock_state()
+        .as_ref()
+        .map(next_poll_delay_ms)
+        .unwrap_or(POLL_15_MIN);
+    unsafe {
+        SetTimer(hwnd, TIMER_POLL, poll_delay, None);
+    }
+    schedule_auto_update_check(hwnd);
+    schedule_countdown_timer();
+    diagnose::log("widget ready");
+    true
+}
+
+/// Forget the widget window and everything tied to it. Usage data, settings
+/// and poll/update state are kept for the next widget.
+fn widget_lost() {
+    let hook = {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return;
+        };
+        s.hwnd = SendHwnd::from_hwnd(HWND::default());
+        s.taskbar_hwnd = None;
+        s.tray_notify_hwnd = None;
+        s.dragging = false;
+        s.win_event_hook.take()
+    };
+    if let Some(hook) = hook {
+        native_interop::unhook_win_event(hook);
+    }
+    tray_icon::mark_unregistered();
+}
+
+/// Runs on the UI thread every WATCHDOG_INTERVAL_MS: re-creates the widget
+/// whenever it is missing (Explorer restart, late taskbar at boot) and, while
+/// it exists, retries tray registration and re-asserts its position.
+fn watchdog() {
+    if EXIT_REQUESTED.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut hwnd = current_widget_hwnd();
+    // Explorer can take the widget down without us ever seeing WM_DESTROY.
+    if !hwnd.is_invalid() && !unsafe { IsWindow(hwnd) }.as_bool() {
+        diagnose::log(format!(
+            "widget hwnd={:?} vanished without WM_DESTROY",
+            hwnd
+        ));
+        widget_lost();
+        hwnd = HWND::default();
+    }
+    if hwnd.is_invalid() {
+        if create_widget() {
+            diagnose::log("watchdog created the widget");
+        }
+        return;
+    }
+    if tray_icon::needs_retry() {
+        diagnose::log("watchdog retrying tray icon registration");
+        sync_tray_icons(hwnd);
+    }
+    if position_at_taskbar() {
+        render_layered();
+    }
+}
+
+fn current_widget_hwnd() -> HWND {
+    lock_state()
+        .as_ref()
+        .map(|s| s.hwnd.to_hwnd())
+        .unwrap_or_default()
+}
+
+/// Post to the current widget, if any. Worker threads look the window up at
+/// post time instead of keeping an HWND: the widget may have been re-created.
+fn post_to_widget(msg: u32) -> bool {
+    let hwnd = current_widget_hwnd();
+    !hwnd.is_invalid() && unsafe { PostMessageW(hwnd, msg, WPARAM(0), LPARAM(0)) }.is_ok()
 }
 
 /// Render widget content and push to the layered window via UpdateLayeredWindow.
@@ -1556,6 +1656,9 @@ fn render_layered() {
     };
 
     let hwnd = hwnd_val.to_hwnd();
+    if hwnd.is_invalid() {
+        return;
+    }
 
     // For non-embedded fallback, just invalidate and let WM_PAINT handle it
     if !embedded {
@@ -1843,8 +1946,61 @@ fn paint_content(
     }
 }
 
-fn do_poll(send_hwnd: SendHwnd) {
-    let hwnd = send_hwnd.to_hwnd();
+/// Delay before the next attempt after `retry_count` consecutive failures:
+/// exponential from RETRY_BASE_MS, capped at the poll interval (auth errors at
+/// AUTH_RETRY_CAP_MS if that is longer). Saturates instead of overflowing.
+fn retry_delay_ms(retry_count: u32, poll_interval_ms: u32, is_auth: bool) -> u32 {
+    let backoff = RETRY_BASE_MS.saturating_mul(
+        1u32.checked_shl(retry_count.saturating_sub(1))
+            .unwrap_or(u32::MAX),
+    );
+    let cap = if is_auth {
+        poll_interval_ms.max(AUTH_RETRY_CAP_MS)
+    } else {
+        poll_interval_ms
+    };
+    backoff.min(cap)
+}
+
+fn next_poll_delay_ms(s: &AppState) -> u32 {
+    if s.retry_count == 0 {
+        s.poll_interval_ms
+    } else {
+        retry_delay_ms(s.retry_count, s.poll_interval_ms, s.last_error_is_auth)
+    }
+}
+
+/// Run a poll on a worker thread unless one is already running. If one is,
+/// `rerun_if_busy` (manual refresh, model switch) makes it poll once more when
+/// done; timer ticks are just dropped so they can't bypass the backoff.
+fn spawn_poll(rerun_if_busy: bool) {
+    {
+        let mut poll = POLL.lock().unwrap_or_else(|e| e.into_inner());
+        if poll.0 {
+            poll.1 |= rerun_if_busy;
+            return;
+        }
+        *poll = (true, false);
+    }
+    let spawned = std::thread::Builder::new().spawn(|| loop {
+        do_poll();
+        let mut poll = POLL.lock().unwrap_or_else(|e| e.into_inner());
+        if poll.1 {
+            poll.1 = false;
+        } else {
+            poll.0 = false;
+            break;
+        }
+    });
+    if let Err(error) = spawned {
+        diagnose::log_error("unable to start poll thread", error);
+        POLL.lock().unwrap_or_else(|e| e.into_inner()).0 = false;
+    }
+}
+
+/// Poll once and record the outcome. Timers are left to the UI thread, which
+/// re-arms them on WM_APP_USAGE_UPDATED.
+fn do_poll() {
     let (show_claude_code, show_codex) = {
         let state = lock_state();
         state
@@ -1871,129 +2027,90 @@ fn do_poll(send_hwnd: SendHwnd) {
                     s.codex_session_percent = 0.0;
                     s.codex_weekly_percent = 0.0;
                 }
-                // Stop fast-poll if reset data is now fresh
-                if !poller::app_is_past_reset(&data) {
-                    unsafe {
-                        let _ = KillTimer(hwnd, TIMER_RESET_POLL);
-                    }
-                }
 
                 s.data = Some(data);
                 s.last_poll_ok = true;
                 refresh_usage_texts(s);
 
-                // Recovered from errors — restore normal poll interval
-                if s.retry_count > 0 {
-                    s.retry_count = 0;
-                    let interval = s.poll_interval_ms;
-                    unsafe {
-                        SetTimer(hwnd, TIMER_POLL, interval, None);
-                    }
-                }
+                s.retry_count = 0;
+                s.last_error_is_auth = false;
+                s.auth_failures = 0;
+                s.auth_notified = false;
                 s.force_notify_auth_error = false;
-                s.auth_error_paused_polling = false;
-                s.auth_watch_mode = poller::CredentialWatchMode::ActiveSource;
-                s.auth_watch_snapshot.clear();
             }
+            drop(state);
 
-            unsafe {
-                let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
-            }
+            post_to_widget(WM_APP_USAGE_UPDATED);
         }
         Err(e) => {
-            let auth_watch = match e {
-                poller::PollError::AuthRequired | poller::PollError::TokenExpired => Some((
-                    poller::CredentialWatchMode::ActiveSource,
-                    poller::credential_watch_snapshot(poller::CredentialWatchMode::ActiveSource),
-                )),
-                poller::PollError::NoCredentials => Some((
-                    poller::CredentialWatchMode::AllSources,
-                    poller::credential_watch_snapshot(poller::CredentialWatchMode::AllSources),
-                )),
-                poller::PollError::RequestFailed => None,
-            };
-            // Distinguish auth-required errors from transient errors.
-            let notify_auth_error = {
+            // Auth errors back off and retry like any other: at boot the CLI
+            // token refresh can just time out, so polling must never stop.
+            let is_auth = !matches!(e, poller::PollError::RequestFailed);
+            let balloon = {
                 let mut state = lock_state();
-                let mut should_notify = false;
-                if let Some(s) = state.as_mut() {
+                let Some(s) = state.as_mut() else {
+                    return;
+                };
+                s.retry_count = s.retry_count.saturating_add(1);
+                s.last_error_is_auth = is_auth;
+                if is_auth {
                     s.last_poll_ok = false;
-                    match auth_watch {
-                        Some((watch_mode, watch_snapshot)) => {
-                            // Only show the balloon on the first failure so it doesn't spam.
-                            if s.retry_count == 0 || s.force_notify_auth_error {
-                                should_notify = true;
-                            }
-                            s.force_notify_auth_error = false;
-                            s.auth_error_paused_polling = true;
-                            s.auth_watch_mode = watch_mode;
-                            s.auth_watch_snapshot = watch_snapshot;
-                            s.session_text = "!".to_string();
-                            s.weekly_text = "!".to_string();
-                            s.codex_session_text = "!".to_string();
-                            s.codex_weekly_text = "!".to_string();
-                            s.retry_count = s.retry_count.saturating_add(1);
-                            unsafe {
-                                let _ = KillTimer(hwnd, TIMER_POLL);
-                                let _ = KillTimer(hwnd, TIMER_RESET_POLL);
-                                let _ = KillTimer(hwnd, TIMER_COUNTDOWN);
-                                SetTimer(hwnd, TIMER_POLL, s.poll_interval_ms, None);
-                            }
-                        }
-                        _ => {
-                            // Transient network / credential-missing errors: exponential backoff.
-                            s.force_notify_auth_error = false;
-                            s.auth_error_paused_polling = false;
-                            s.auth_watch_mode = poller::CredentialWatchMode::ActiveSource;
-                            s.auth_watch_snapshot.clear();
-                            s.session_text = "...".to_string();
-                            s.weekly_text = "...".to_string();
-                            s.codex_session_text = "...".to_string();
-                            s.codex_weekly_text = "...".to_string();
-                            s.retry_count = s.retry_count.saturating_add(1);
-                            let backoff = RETRY_BASE_MS.saturating_mul(
-                                1u32.checked_shl(s.retry_count - 1).unwrap_or(u32::MAX),
-                            );
-                            let retry_ms = backoff.min(s.poll_interval_ms);
-                            unsafe {
-                                let _ = KillTimer(hwnd, TIMER_RESET_POLL);
-                                SetTimer(hwnd, TIMER_POLL, retry_ms, None);
-                            }
-                        }
-                    }
+                    s.session_text = "!".to_string();
+                    s.weekly_text = "!".to_string();
+                    s.codex_session_text = "!".to_string();
+                    s.codex_weekly_text = "!".to_string();
+                } else if s.last_poll_ok {
+                    // Transient failure: keep showing the last good values
+                    // (and replace the "..." a manual refresh put up).
+                    refresh_usage_texts(s);
+                } else {
+                    s.session_text = "...".to_string();
+                    s.weekly_text = "...".to_string();
+                    s.codex_session_text = "...".to_string();
+                    s.codex_weekly_text = "...".to_string();
                 }
-                should_notify
+
+                // Once per failure streak: 401/403 right away, expired / missing
+                // credentials only once they persist; always on a manual
+                // refresh. Needs a widget, whose tray icon shows the balloon.
+                if is_auth {
+                    s.auth_failures = s.auth_failures.saturating_add(1);
+                }
+                let notify = is_auth
+                    && !s.hwnd.to_hwnd().is_invalid()
+                    && (s.force_notify_auth_error
+                        || (!s.auth_notified
+                            && (matches!(e, poller::PollError::AuthRequired)
+                                || s.auth_failures >= AUTH_NOTIFY_AFTER_FAILURES)));
+                s.force_notify_auth_error = false;
+                if notify {
+                    s.auth_notified = true;
+                }
+                notify.then(|| {
+                    let strings = s.language.strings();
+                    if s.show_claude_code {
+                        (
+                            s.hwnd.to_hwnd(),
+                            tray_icon::TrayIconKind::Claude,
+                            strings.token_expired_title,
+                            strings.token_expired_body,
+                        )
+                    } else {
+                        (
+                            s.hwnd.to_hwnd(),
+                            tray_icon::TrayIconKind::Codex,
+                            strings.codex_token_expired_title,
+                            strings.codex_token_expired_body,
+                        )
+                    }
+                })
             };
 
-            if notify_auth_error {
-                let balloon = {
-                    let state = lock_state();
-                    state.as_ref().map(|s| {
-                        if s.show_claude_code {
-                            (
-                                s.language.strings(),
-                                tray_icon::TrayIconKind::Claude,
-                                s.language.strings().token_expired_title,
-                                s.language.strings().token_expired_body,
-                            )
-                        } else {
-                            (
-                                s.language.strings(),
-                                tray_icon::TrayIconKind::Codex,
-                                s.language.strings().codex_token_expired_title,
-                                s.language.strings().codex_token_expired_body,
-                            )
-                        }
-                    })
-                };
-                if let Some((_strings, kind, title, body)) = balloon {
-                    tray_icon::notify_balloon(hwnd, kind, title, body);
-                }
+            if let Some((hwnd, kind, title, body)) = balloon {
+                tray_icon::notify_balloon(hwnd, kind, title, body);
             }
 
-            unsafe {
-                let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
-            }
+            post_to_widget(WM_APP_USAGE_UPDATED);
         }
     }
 }
@@ -2006,6 +2123,10 @@ fn schedule_countdown_timer() {
     };
 
     let hwnd = s.hwnd.to_hwnd();
+    // SetTimer on a null HWND would create a new thread timer on every call.
+    if hwnd.is_invalid() {
+        return;
+    }
     if !s.last_poll_ok {
         unsafe {
             let _ = KillTimer(hwnd, TIMER_COUNTDOWN);
@@ -2019,10 +2140,14 @@ fn schedule_countdown_timer() {
         None => return,
     };
 
-    // If a reset time has passed, poll every 5s to pick up fresh data
-    if poller::app_is_past_reset(data) {
-        unsafe {
+    // Right after a reset time passes, poll every 5s to pick up fresh data
+    // (not while backing off from errors). This is the only place that owns
+    // TIMER_RESET_POLL.
+    unsafe {
+        if s.retry_count == 0 && poller::app_is_past_reset(data) {
             SetTimer(hwnd, TIMER_RESET_POLL, 5_000, None);
+        } else {
+            let _ = KillTimer(hwnd, TIMER_RESET_POLL);
         }
     }
 
@@ -2117,7 +2242,12 @@ fn tray_reposition_is_suppressed() -> bool {
     }
 }
 
-fn position_at_taskbar() {
+/// Place the widget next to the tray. Returns true if its placement changed.
+fn position_at_taskbar() -> bool {
+    /// (hwnd, screen left, top, right, bottom)
+    type Placement = (isize, i32, i32, i32, i32);
+    static LAST_PLACEMENT: Mutex<Option<Placement>> = Mutex::new(None);
+
     refresh_dpi();
     // Drop the app-state lock before any Win32 call that may synchronously
     // re-enter our window procedure.
@@ -2125,19 +2255,24 @@ fn position_at_taskbar() {
         let state = lock_state();
         let s = match state.as_ref() {
             Some(s) => s,
-            None => return,
+            None => return false,
         };
+
+        // No widget right now
+        if s.hwnd.to_hwnd().is_invalid() {
+            return false;
+        }
 
         // Don't fight the user's drag
         if s.dragging {
-            return;
+            return false;
         }
 
         let taskbar_hwnd = match s.taskbar_hwnd {
             Some(h) => h,
             None => {
                 diagnose::log("position_at_taskbar skipped: no taskbar handle");
-                return;
+                return false;
             }
         };
 
@@ -2148,7 +2283,7 @@ fn position_at_taskbar() {
         Some(r) => r,
         None => {
             diagnose::log("position_at_taskbar skipped: unable to query taskbar rect");
-            return;
+            return false;
         }
     };
 
@@ -2167,27 +2302,48 @@ fn position_at_taskbar() {
 
     let widget_height = sc(WIDGET_HEIGHT);
     let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
-    if embedded {
-        // Child window: coordinates relative to parent (taskbar)
-        let x = tray_left - taskbar_rect.left - widget_width - tray_offset;
-        native_interop::move_window(hwnd, x, y - taskbar_rect.top, widget_width, widget_height);
-        diagnose::log(format!(
-            "positioned embedded widget at x={x} y={} w={widget_width} h={widget_height}",
-            y - taskbar_rect.top
-        ));
+    let (x, y) = if embedded {
+        // Child window: coordinates relative to parent (taskbar). A stale
+        // tray_offset must not push it off the left edge.
+        (
+            (tray_left - taskbar_rect.left - widget_width - tray_offset).max(0),
+            y - taskbar_rect.top,
+        )
     } else {
         // Topmost popup: screen coordinates
-        let x = tray_left - widget_width - tray_offset;
-        native_interop::move_window(hwnd, x, y, widget_width, widget_height);
-        diagnose::log(format!(
-            "positioned fallback widget at x={x} y={y} w={widget_width} h={widget_height}"
-        ));
+        (tray_left - widget_width - tray_offset, y)
+    };
+    native_interop::move_window(hwnd, x, y, widget_width, widget_height);
+
+    // The watchdog calls this every few seconds: only log and move the
+    // character (which re-asserts HWND_TOPMOST) when the widget's screen
+    // rectangle changed. Screen, not parent-relative, coordinates so that a
+    // moved taskbar also re-anchors the character.
+    let Some(rect) = native_interop::get_window_rect_safe(hwnd) else {
+        return false;
+    };
+    let placement = (
+        hwnd.0 as isize,
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+    );
+    {
+        let mut last = LAST_PLACEMENT.lock().unwrap_or_else(|e| e.into_inner());
+        if *last == Some(placement) {
+            return false;
+        }
+        *last = Some(placement);
     }
+    diagnose::log(format!(
+        "positioned {} widget at x={x} y={y} w={widget_width} h={widget_height}",
+        if embedded { "embedded" } else { "fallback" }
+    ));
 
     // Keep the character window anchored above the widget.
-    if let Some(rect) = native_interop::get_window_rect_safe(hwnd) {
-        character::reposition(rect);
-    }
+    character::reposition(rect);
+    true
 }
 
 fn compute_anchor_y(anchor_top: i32, anchor_height: i32, widget_height: i32) -> i32 {
@@ -2287,43 +2443,7 @@ unsafe extern "system" fn wnd_proc(
             let timer_id = wparam.0;
             match timer_id {
                 TIMER_POLL => {
-                    let auth_watch = {
-                        let state = lock_state();
-                        state.as_ref().map(|s| {
-                            (
-                                s.auth_error_paused_polling,
-                                s.auth_watch_mode,
-                                s.auth_watch_snapshot.clone(),
-                            )
-                        })
-                    };
-                    match auth_watch {
-                        Some((true, watch_mode, previous_snapshot)) => {
-                            let current_snapshot = poller::credential_watch_snapshot(watch_mode);
-                            if current_snapshot != previous_snapshot {
-                                let mut state = lock_state();
-                                if let Some(s) = state.as_mut() {
-                                    if s.auth_error_paused_polling
-                                        && s.auth_watch_mode == watch_mode
-                                    {
-                                        s.auth_watch_snapshot = current_snapshot;
-                                    }
-                                }
-                                drop(state);
-                                let sh = SendHwnd::from_hwnd(hwnd);
-                                std::thread::spawn(move || {
-                                    do_poll(sh);
-                                });
-                            }
-                        }
-                        Some((false, _, _)) => {
-                            let sh = SendHwnd::from_hwnd(hwnd);
-                            std::thread::spawn(move || {
-                                do_poll(sh);
-                            });
-                        }
-                        None => {}
-                    }
+                    spawn_poll(false);
                 }
                 TIMER_COUNTDOWN => {
                     update_display();
@@ -2331,28 +2451,22 @@ unsafe extern "system" fn wnd_proc(
                     schedule_countdown_timer();
                 }
                 TIMER_RESET_POLL => {
-                    let should_poll = {
-                        let state = lock_state();
-                        state
-                            .as_ref()
-                            .map(|s| !s.auth_error_paused_polling)
-                            .unwrap_or(false)
-                    };
-                    if should_poll {
-                        let sh = SendHwnd::from_hwnd(hwnd);
-                        std::thread::spawn(move || {
-                            do_poll(sh);
-                        });
-                    }
+                    spawn_poll(false);
                 }
                 TIMER_UPDATE_CHECK => {
-                    begin_update_check(hwnd, false);
+                    begin_update_check(false);
                 }
                 _ => {}
             }
             LRESULT(0)
         }
         WM_APP_USAGE_UPDATED => {
+            // Timers are only (re)armed here on the UI thread; the poll worker
+            // just records its outcome and posts this message.
+            let poll_delay = lock_state().as_ref().map(next_poll_delay_ms);
+            if let Some(delay) = poll_delay {
+                SetTimer(hwnd, TIMER_POLL, delay, None);
+            }
             check_theme_change();
             check_language_change();
             render_layered();
@@ -2583,10 +2697,8 @@ unsafe extern "system" fn wnd_proc(
                         }
                     }
                     render_layered();
-                    let sh = SendHwnd::from_hwnd(hwnd);
-                    std::thread::spawn(move || {
-                        do_poll(sh);
-                    });
+                    poller::reset_refresh_backoff();
+                    spawn_poll(true);
                 }
                 IDM_VERSION_ACTION => {
                     let (install_channel, release) = {
@@ -2606,29 +2718,24 @@ unsafe extern "system" fn wnd_proc(
                     match install_channel {
                         InstallChannel::Winget => {
                             if release.is_some() {
-                                begin_winget_update(hwnd);
+                                begin_winget_update();
                             } else {
-                                begin_update_check(hwnd, true);
+                                begin_update_check(true);
                             }
                         }
                         InstallChannel::Portable => {
                             if let Some(release) = release {
-                                begin_update_apply(hwnd, release);
+                                begin_update_apply(release);
                             } else {
-                                begin_update_check(hwnd, true);
+                                begin_update_check(true);
                             }
                         }
                     }
                 }
                 2 => {
-                    let hook = {
-                        let state = lock_state();
-                        state.as_ref().and_then(|s| s.win_event_hook)
-                    };
-                    if let Some(h) = hook {
-                        native_interop::unhook_win_event(h);
-                    }
-                    PostQuitMessage(0);
+                    // Cleanup (hook, tray icons, character) happens in WM_DESTROY.
+                    EXIT_REQUESTED.store(true, Ordering::Relaxed);
+                    let _ = DestroyWindow(hwnd);
                 }
                 IDM_RESET_POSITION => {
                     {
@@ -2688,10 +2795,7 @@ unsafe extern "system" fn wnd_proc(
                     position_at_taskbar();
                     render_layered();
                     sync_tray_icons(hwnd);
-                    let sh = SendHwnd::from_hwnd(hwnd);
-                    std::thread::spawn(move || {
-                        do_poll(sh);
-                    });
+                    spawn_poll(true);
                 }
                 IDM_LANG_SYSTEM
                 | IDM_LANG_ENGLISH
@@ -2843,17 +2947,32 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
+        WM_CLOSE => {
+            // The update flow posts this to make the app exit.
+            EXIT_REQUESTED.store(true, Ordering::Relaxed);
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
         WM_DESTROY => {
-            let hook = {
-                let state = lock_state();
-                state.as_ref().and_then(|s| s.win_event_hook)
-            };
-            if let Some(h) = hook {
-                native_interop::unhook_win_event(h);
+            if hwnd == current_widget_hwnd() {
+                widget_lost();
             }
-            character::destroy();
+            // The icons belong to this hwnd; a re-created widget registers its
+            // own, so don't leave these behind as ghosts.
             tray_icon::remove_all(hwnd);
-            PostQuitMessage(0);
+            if EXIT_REQUESTED.load(Ordering::Relaxed) {
+                // Only on a real exit: destroying the character early would make
+                // save_state_settings persist characters_enabled = false.
+                character::destroy();
+                PostQuitMessage(0);
+            } else {
+                // Taken down with the taskbar (Explorer restart): keep running,
+                // the watchdog creates a new widget once a taskbar exists.
+                diagnose::log(format!(
+                    "widget hwnd={:?} destroyed without exit request",
+                    hwnd
+                ));
+            }
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -3929,5 +4048,32 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
         let _ = FillRgn(hdc, rgn, brush);
         let _ = DeleteObject(rgn);
         let _ = DeleteObject(brush);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_delay_backs_off_exponentially() {
+        assert_eq!(retry_delay_ms(1, POLL_15_MIN, false), RETRY_BASE_MS);
+        assert_eq!(retry_delay_ms(2, POLL_15_MIN, false), 2 * RETRY_BASE_MS);
+        // Logged out with a 1-minute interval: 30 s, 1 min, 2 min, 4 min, then 5 min.
+        let auth: Vec<u32> = (1..=6)
+            .map(|n| retry_delay_ms(n, POLL_1_MIN, true))
+            .collect();
+        assert_eq!(auth, [30_000, 60_000, 120_000, 240_000, 300_000, 300_000]);
+    }
+
+    #[test]
+    fn retry_delay_saturates_at_the_cap() {
+        for retry_count in [29, 33, u32::MAX] {
+            assert_eq!(retry_delay_ms(retry_count, POLL_1_MIN, false), POLL_1_MIN);
+            assert_eq!(retry_delay_ms(retry_count, POLL_15_MIN, false), POLL_15_MIN);
+            // Auth errors cap at 5 minutes, or the poll interval if that is longer.
+            assert_eq!(retry_delay_ms(retry_count, POLL_1_MIN, true), POLL_5_MIN);
+            assert_eq!(retry_delay_ms(retry_count, POLL_1_HOUR, true), POLL_1_HOUR);
+        }
     }
 }
